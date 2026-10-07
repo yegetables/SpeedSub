@@ -1,8 +1,11 @@
-name = "sublink-worker"
+name = "speedsub"
 main = "sublink-worker.js"
 compatibility_date = "2025-09-07"
 
-# 说明：
-# - 不在此文件写 KV id（避免私有 id 入库），KV 绑定请在 Cloudflare 后台添加，
-#   变量名必须为 SpeedSub_KV；未绑定时 worker 自动降级为手动模式。
-# - 不再使用 keep_vars：本实现不需要任何环境变量，部署时保持绑定干净。
+# 说明：未绑定 KV 时全功能可用（手动模式）。
+# 启用配置档（可选）：取消下面注释并填入你自己的 KV namespace id。
+# ⚠️ id 属于私有信息，不要提交到公开仓库（本地部署可用 wrangler.prod.toml，
+#    或在 Cloudflare 后台直接添加绑定，变量名必须为 SpeedSub_KV）。
+# [[kv_namespaces]]
+# binding = "SpeedSub_KV"
+# id = "your-kv-namespace-id"
