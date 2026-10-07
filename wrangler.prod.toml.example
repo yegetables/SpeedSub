@@ -2,7 +2,7 @@
 #   npx wrangler@4 deploy -c wrangler.prod.toml
 # 该文件不应提交到 git（已加入 .gitignore），KV id 属于私有信息。
 name = "speedsub"
-main = "_worker.js"
+main = "sublink-worker.js"
 compatibility_date = "2025-09-07"
 
 [[kv_namespaces]]
