@@ -1,0 +1,13 @@
+# 本地备份（.bak/ 约定）
+.bak/
+
+# Cloudflare cf CLI 本地缓存（含账号 id，勿入库）
+.cloudflare/
+
+# codegraph 索引
+.codegraph/
+
+# 依赖
+node_modules/
+wrangler.prod.toml
+.wrangler/
