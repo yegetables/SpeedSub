@@ -63,6 +63,22 @@ npx wrangler@4 deploy        # 部署名在 wrangler.toml 的 name 里，可自�
 
 > `wrangler.toml` 不含任何私有信息（KV id 等），可直接入库使用。
 
+### 方式四：连接 Git 仓库（push 自动部署，推荐长期使用）
+
+把仓库连到 Worker 后，**每次 `git push` 自动构建并部署**，改配置/改代码零手工操作。
+
+1. Workers → 你的 Worker → **设置 → 构建** → 连接 Git 仓库 → 选本仓库、分支 `main`
+2. **添加构建变量**（敏感文本）：`KV_NAMESPACE_ID` = 你的 KV namespace id
+3. **部署命令改为**（覆盖默认的 `npx wrangler deploy`，用模板现场生成带 KV 的配置，KV 绑定不会丢）：
+
+```sh
+sh -c 'sed "s/在此填入你的 KV namespace id/$KV_NAMESPACE_ID/" wrangler.prod.toml.example > wrangler.deploy.toml && npx wrangler deploy -c wrangler.deploy.toml'
+```
+
+4. 保存后自动触发首次构建。之后每次 push 到 `main` 即自动部署。
+
+> 本仓库自身就是这么部署的：[SpeedSub 线上示例](https://speedsub.yegetables.com)。
+
 ---
 
 ## 启用配置档（可选）
@@ -81,7 +97,9 @@ npx wrangler@4 deploy        # 部署名在 wrangler.toml 的 name 里，可自�
 
 ## 使用
 
-打开 Worker 地址，按下面填：
+**三步上手**：① 部署后打开 Worker 地址；② 贴源订阅 + 实测列表（文本或远程 URL）；③ 点「生成订阅地址」复制给客户端。之后要改，只改②再点生成；绑定了 KV 就「保存为新配置档」用固定短链。
+
+打开页面后的字段说明：
 
 | 字段 | 说明 |
 |---|---|
@@ -151,7 +169,14 @@ https://你的域名/<自定义路径，默认 /re>?url=<源订阅>&add=<实测�
 
 ## 开发
 
-单文件 Worker（`sublink-worker.js`），无构建、无依赖。语法检查 `node --check sublink-worker.js`。
+单文件 Worker（`sublink-worker.js`），无构建、无依赖。
+
+```sh
+node --check sublink-worker.js   # 语法检查
+npx wrangler@4 dev               # 本地预览（改代码即时生效，不部署）
+```
+
+本地测试（miniflare + undici MockAgent 覆盖配对/TLS 对齐/格式/UA/KV 全场景）脚本未随仓库分发，需要的话提 issue。
 
 ---
 
