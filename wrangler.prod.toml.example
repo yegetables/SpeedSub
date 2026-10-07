@@ -6,5 +6,5 @@ main = "_worker.js"
 compatibility_date = "2025-09-07"
 
 [[kv_namespaces]]
-binding = "SUBLINK_KV"
+binding = "SpeedSub_KV"
 id = "在此填入你的 KV namespace id"

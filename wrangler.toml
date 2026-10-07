@@ -4,5 +4,5 @@ compatibility_date = "2025-09-07"
 
 # 说明：
 # - 不在此文件写 KV id（避免私有 id 入库），KV 绑定请在 Cloudflare 后台添加，
-#   变量名必须为 SUBLINK_KV；未绑定时 worker 自动降级为手动模式。
+#   变量名必须为 SpeedSub_KV；未绑定时 worker 自动降级为手动模式。
 # - 不再使用 keep_vars：本实现不需要任何环境变量，部署时保持绑定干净。

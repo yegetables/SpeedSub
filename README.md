@@ -56,7 +56,7 @@ npx wrangler@4 deploy        # 部署名在 wrangler.toml 的 name 里，可自�
 绑定 KV 后可获得「保存配置档 + 短订阅地址」：改配置后客户端刷新即生效，无需换链接。
 
 1. Cloudflare 控制台 → **存储和数据库 → KV**：创建一个 namespace（名称随意）
-2. **Workers → 你的 Worker → 设置 → 绑定**：添加 KV Namespace，**变量名必须填 `SUBLINK_KV`**
+2. **Workers → 你的 Worker → 设置 → 绑定**：添加 KV Namespace，**变量名必须填 `SpeedSub_KV`**
 3. 重新部署（或保存绑定）。页面顶部会显示「KV 已绑定」
 
 短地址形如 `https://你的域名/s/<档id>?k=<密钥>`。**源订阅里含你的节点凭据（uuid 等），`k` 密钥请与短地址一起保管**。

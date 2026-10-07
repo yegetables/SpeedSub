@@ -1,5 +1,5 @@
 /*
- * 实测优选订阅改写器 (SUBLINK)
+ * SpeedSub · 实测优选订阅改写器
  *
  * 用途：源订阅（别人生成的、连接信息固定的节点）的全部内容保持不变，
  *       仅把节点的「地址:端口」按位置替换成你自己实测的优选列表，再输出成新订阅。
@@ -11,11 +11,11 @@
  *   /api/profile...         配置档增删改（需绑定 KV）
  *
  * 环境变量（全部可选）：
- *   SUBLINK_KV   KV namespace binding 名。未绑定时全站降级为「手动模式」，
+ *   SpeedSub_KV   KV namespace binding 名。未绑定时全站降级为「手动模式」，
  *                页面与 /re 一切功能正常，只是没有配置档与短地址。
  */
 
-const KV绑定名 = 'SUBLINK_KV';
+const KV绑定名 = 'SpeedSub_KV';
 const 配置键前缀 = 'prof:';
 const 配置索引键 = 'prof:index';
 
