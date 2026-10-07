@@ -3,7 +3,7 @@
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/yegetables/SpeedSub)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 
-把**机场订阅 / 自建订阅 / 节点链接**里的节点「地址:端口」，按位置替换成**你自己实测的优选 IP 列表**，其余连接参数（uuid、path、Host、传输层配置）逐字保留，输出成你自己的订阅。
+把 **Cloudflare 节点订阅 / 自建订阅 / 节点链接**里的节点「地址:端口」，按位置替换成**你自己实测的优选 IP 列表**，其余连接参数（uuid、path、Host、传输层配置）逐字保留，输出成你自己的订阅。
 
 > 典型场景：你手里有一份能用的订阅，但它的优选线路是别人测的；你自己跑测速得到一批更快的优选 IP（IPv4/IPv6、指定端口）。SpeedSub 把两者合到一起：**连接方式用源订阅的，线路用你实测的**。
 >
@@ -19,7 +19,7 @@
 ✘ 不可行：你 → CF边缘(实测IP) → 裸VPS（源站不在CF后面）
 ```
 
-**判定方法**：源节点的 `host`（ws 头）/`sni`/`servername`/`server` 至少有一个是**橙色云代理的域名**（Worker 域名、开了 CF 代理的站点）。机场"Worker 节点"、edgetunnel 类订阅天然满足。
+**判定方法**：源节点的 `host`（ws 头）/`sni`/`servername`/`server` 至少有一个是**橙色云代理的域名**（Worker 域名、开了 CF 代理的站点）。edgetunnel 类自建订阅、以及卖"CF Worker 节点"的服务都天然满足；**机场的普通 VPS 节点不是**。
 
 **非 CF 节点替换后必然连不上**（优选 IP 指向 CF 边缘，边缘不会转发给不在 CF 后面的源站）。工具不做自动校验，请自查源订阅；替换永远只改地址/端口/名称，其余参数保留，所以喂什么源就产什么。
 
@@ -103,7 +103,7 @@ sh -c 'sed "s/在此填入你的 KV namespace id/$KV_NAMESPACE_ID/" wrangler.pro
 
 | 字段 | 说明 |
 |---|---|
-| **源订阅地址** | 机场订阅 / 自建订阅 URL；也可以直接粘贴节点链接（每行一个） |
+| **源订阅地址** | Cloudflare 节点订阅 / 自建订阅 URL；也可以直接粘贴节点链接（每行一个） |
 | **拉取源订阅的客户端类型** | 自适应订阅按 UA 返回不同内容。默认自动跟随；要拿 Clash YAML 选 **Clash**（输出格式建议同时选 Clash 配置） |
 | **实测优选列表** | 每行一条：`ip:端口`、`ip:端口#名称`、`[IPv6]:端口`、裸 `IPv6:端口` 亦可。也可改用「远程 URL」模式（列表内容更新后订阅自动跟随） |
 | **生成数量** | 留空 = 全部；填 N = 只取列表前 N 条 |
