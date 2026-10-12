@@ -77,7 +77,16 @@ const 拉取UA预设 = {
 
 function 解析拉取UA(pullua, 客户端UA) {
 	const v = (pullua || '').trim();
-	if (!v || v === 'auto') return (客户端UA || '').trim() || 'v2rayN/7.13.5';
+	if (!v || v === 'auto') {
+		// auto = 按客户端类型映射到预设；未知客户端（curl/探活/浏览器）兜底 v2rayn，
+		// 避免把无特征 UA 原样转发给自适应订阅导致 403
+		const ua = (客户端UA || '').toLowerCase();
+		if (ua.includes('clash') || ua.includes('mihomo') || ua.includes('stash')) return 拉取UA预设.clash;
+		if (ua.includes('v2rayng') || ua.includes('v2rayn') || ua.includes('xray') || ua.includes('sing-box')) return 拉取UA预设.v2rayng;
+		if (ua.includes('surge')) return 拉取UA预设.surge;
+		if (ua.includes('shadowrocket')) return 拉取UA预设.shadowrocket;
+		return 拉取UA预设.v2rayn;
+	}
 	return 拉取UA预设[v.toLowerCase()] || v;
 }
 
@@ -179,6 +188,15 @@ function 取原端口(权威) {
  * 实测列表的端口与源节点的 TLS 属性可能不一致，替换端口时自动对齐，否则必然连不上。
  */
 const TLS端口 = ['443', '2053', '2083', '2087', '2096', '8443'];
+
+// 信息节点（有效期/流量展示占位节点）按名称关键词识别：原样保留，不参与配对
+const 信息节点关键词 = ['剩余', '过期', '到期', '还剩', '流量', '重置', '官网', '套餐', 'expire', 'remaining', 'expirein', 'traffic'];
+
+function 是信息节点(名称) {
+	const t = String(名称 || '').toLowerCase();
+	if (!t) return false;
+	return 信息节点关键词.some(k => t.includes(k.toLowerCase()));
+}
 const HTTP端口 = ['80', '8080', '8880', '2052', '2082', '2086', '2095'];
 
 function 解析查询参数(查询) {
@@ -365,8 +383,10 @@ function 改写节点列表(明文, 条目列表, TLS对齐) {
 
 	for (const 行 of 行数组) {
 		const 节点 = 解析节点(行);
-		if (节点) 可改写.push(节点);
-		else 透传.push(行);
+		if (!节点) { 透传.push(行); continue; }
+		// 信息节点（剩余/到期等）原样保留，不占用配对位置
+		if (是信息节点(取节点名称(行))) { 透传.push(行); continue; }
+		可改写.push(节点);
 	}
 
 	if (!可改写.length) return null;
@@ -456,7 +476,19 @@ function 找Clash节点(行数组) {
 			if (键) 记录Clash字段(当前, 键[1], 键[2], i);
 		}
 	}
-	if (当前) 当前.结束行 = 行数组.length - 1;
+	// 最后一个节点也只算到文件尾：若有后续顶层段（proxy-groups/rules 等），结束行应为
+	// 「该节点末行」，即 proxies 段结束（下一个顶层键之前）——由下面的顶层键检测兜底，
+	// 这里仅当节点真的是文件最后一项时才等于 length-1。
+	// 实现：结束行 = 从节点起始行向后找，遇到第一个非空行且缩进 <= 节点项缩进的行之前。
+	if (当前) {
+		let 终 = 行数组.length - 1;
+		for (let j = 当前.起始行 + 1; j < 行数组.length; j++) {
+			const l = 行数组[j];
+			if (l.trim() === '' || l.trim().startsWith('#')) continue;
+			if (!/^\s/.test(l)) { 终 = j - 1; break; } // 下一个顶层键：本节点结束于前一行
+		}
+		当前.结束行 = 终;
+	}
 	return 节点;
 }
 
@@ -492,9 +524,18 @@ function 改写Clash配置(文本, 条目列表, TLS对齐) {
 	const 待删除 = [];
 	const 保留名 = new Set();
 
+	// 信息节点（剩余/到期等）原样保留：不参与配对，也不被删除
+	const 信息节点集 = new Set();
+	const 真实节点 = [];
+	for (const 节点 of 节点列表) {
+		if (节点.name && 是信息节点(String(节点.name.值).replace(/^["']|["']$/g, ''))) 信息节点集.add(节点);
+		else 真实节点.push(节点);
+	}
+
 	for (let i = 0; i < 条目列表.length; i++) {
 		const 条目 = 条目列表[i];
-		const 节点 = 节点列表[i] || 节点列表[0]; // 溢出用第一个节点作模板
+		const 节点 = 真实节点[i] || 真实节点[0]; // 溢出用第一个真实节点作模板
+		if (!节点) break;
 
 		const 原端口 = 节点.port ? parseInt(String(节点.port.值).replace(/["']/g, ''), 10) : null;
 		const 端口 = 取端口(条目, 原端口);
@@ -558,14 +599,39 @@ function 改写Clash配置(文本, 条目列表, TLS对齐) {
 		if (原名 && 原名 !== 唯一) 新旧名.push([原名, 唯一]);
 	}
 
+	// 多余的真实节点（真实节点数 > 实测条数）：整条删除，让 proxies 只剩实测条数
+	// 信息节点原样保留
+	const 配对节点集 = new Set();
+	for (let i = 0; i < 条目列表.length && i < 真实节点.length; i++) 配对节点集.add(真实节点[i]);
+	const 删除行集合 = [];
+	for (const 节点 of 真实节点) {
+		if (配对节点集.has(节点)) continue;
+		if (节点.流式) 删除行集合.push(节点.行号);
+		else {
+			for (let i = 节点.起始行; i <= 节点.结束行; i++) 删除行集合.push(i);
+		}
+	}
+	// 信息节点不在 真实节点 列表里，因此不会进入删除集合
+
 	// 行级插入/删除从后往前应用，避免行号位移
 	const 操作 = [];
 	待删除.forEach(行号 => 操作.push({ 行号, 删除: true }));
+	删除行集合.forEach(行号 => 操作.push({ 行号, 删除: true }));
 	待插入.forEach(o => 操作.push({ 行号: o.行号, 文本: o.文本 }));
 	操作.sort((a, b) => b.行号 - a.行号);
 	for (const op of 操作) {
 		if (op.删除) 行数组.splice(op.行号, 1);
 		else 行数组.splice(op.行号 + 1, 0, ...op.文本);
+	}
+
+	// 被删除的多余节点：其 proxy-groups 成员引用也要移除
+	const 删除节点旧名 = [];
+	for (const 节点 of 节点列表) {
+		if (信息节点集.has(节点)) continue;
+		if (配对节点集.has(节点)) continue;
+		if (!节点.name) continue;
+		const 旧名 = String(节点.name.值).replace(/^["']|["']$/g, '').trim();
+		if (旧名) 删除节点旧名.push(旧名);
 	}
 
 	// 同步 proxy-groups 中的旧名称引用
@@ -614,6 +680,14 @@ function 改写Clash配置(文本, 条目列表, TLS对齐) {
 			if (在成员列表 && /^\s*-\s*/.test(l)) {
 				const 成员 = l.replace(/^\s*-\s*/, '').replace(/["',]/g, '').trim();
 				if (成员 && !保留名.has(成员) && !特殊.has(成员) && !组名.has(成员)) 待删成员.push(i);
+			}
+			// 删除节点（配对未用到）的旧名成员引用：精确匹配移除
+			if (删除节点旧名.length && /^\s*-\s*/.test(l)) {
+				for (const 旧名 of 删除节点旧名) {
+					const 转义 = 旧名.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+					const 正则 = new RegExp('^(\\s*-\\s*)(["\']?)' + 转义 + '\\2(\\s*,?\\s*)$');
+					if (正则.test(l)) { 待删成员.push(i); break; }
+				}
 			}
 		}
 		待删成员.sort((a, b) => b - a).forEach(i => 行数组.splice(i, 1));
@@ -1023,7 +1097,7 @@ async function 改写订阅(配置, 用户代理, 原始UA) {
 	}
 
 	let 输出 = 改写后;
-	const 格式 = (配置.format || 'auto').toLowerCase();
+	const 格式 = (配置.format || 'clash').toLowerCase();
 	const 浏览器 = /mozilla|chrome|safari|firefox|edge/i.test(用户代理 || '');
 
 	if (格式 === 'clash') {
@@ -1130,7 +1204,7 @@ async function 处理配置档接口(request, url, env) {
 			add: 提交.add || '',
 			addapi: 提交.addapi || '',
 			num: 提交.num || '',
-			format: 提交.format || 'auto',
+			format: 提交.format || 'clash',
 			template: 提交.template || '',
 			tls: 提交.tls || '1',
 			ua: 提交.ua || '0',
@@ -1312,10 +1386,10 @@ const HTML模板 = `<!DOCTYPE html>
 			<div class="input-group">
 				<label for="format">输出格式</label>
 				<select id="format" onchange="切换模板框()">
+					<option value="clash" selected>Clash 配置（默认）</option>
 					<option value="auto">自动（跟随源）</option>
 					<option value="base64">base64</option>
 					<option value="plain">明文</option>
-					<option value="clash">Clash 配置</option>
 				</select>
 			</div>
 		</div>
@@ -1374,7 +1448,7 @@ const HTML模板 = `<!DOCTYPE html>
 			document.getElementById('add').value = 读档('add');
 			document.getElementById('addapi').value = 读档('addapi');
 			document.getElementById('num').value = 读档('num');
-			document.getElementById('format').value = 读档('format') || 'auto';
+			document.getElementById('format').value = 读档('format') || 'clash';
 			document.getElementById('template').value = 读档('template');
 			document.getElementById('path').value = 读档('path');
 			document.getElementById('listSrc').value = 读档('listSrc') || 'text';
@@ -1429,7 +1503,7 @@ const HTML模板 = `<!DOCTYPE html>
 			}
 			if (取值('num')) 参数.push('num=' + encodeURIComponent(取值('num')));
 			var format = 取值('format');
-			if (format && format !== 'auto') 参数.push('format=' + encodeURIComponent(format));
+			if (format && format !== 'clash') 参数.push('format=' + encodeURIComponent(format));
 			if (format === 'clash' && 取值('template')) 参数.push('template=' + encodeURIComponent(取值('template')));
 			if (!document.getElementById('tlsFix').checked) 参数.push('tls=0');
 			if (document.getElementById('uaGen').checked) 参数.push('ua=1');
@@ -1598,7 +1672,7 @@ export default {
 					add: url.searchParams.get('add') || '',
 					addapi: url.searchParams.get('addapi') || '',
 					num: url.searchParams.get('num') || '',
-					format: url.searchParams.get('format') || 'auto',
+					format: url.searchParams.get('format') || 'clash',
 					template: url.searchParams.get('template') || '',
 					tls: url.searchParams.get('tls') || '1',
 					ua: url.searchParams.get('ua') || '0',
