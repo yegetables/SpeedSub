@@ -1,992 +1,1716 @@
 /*
- * SpeedSub · 实测优选订阅改写器
+ * SpeedSub · Cloudflare 优选订阅改写与多源聚合器
  *
- * 用途：源订阅（别人生成的、连接信息固定的节点）的全部内容保持不变，
- *       仅把节点的「地址:端口」按位置替换成你自己实测的优选列表，再输出成新订阅。
+ * 核心原则：
+ *   1. 仅处理 IP（server/add）、端口（port）与节点名称（name/ps/#），绝不修改 tls、sni、ech-opts 等节点配置选项。
+ *   2. 纯汇总模式（未填 CF 优选数据）：多源并发聚合 + 双向格式转换 + 全局去重，不精简不改写原节点。
+ *   3. CF 优选模式：三层精准识别 CF 节点，按独立落地归并保留 1 条基准原节点，Append 优选节点严格按 TLS / 非 TLS 端口池对口配对。
  *
  * 路由：
- *   /                       页面
- *   /re?url=&add=&addapi=&num=&format=    临时直连改写（不依赖 KV）
- *   /s/<档id>?k=<密钥>      读取 KV 中的配置档后改写
- *   /api/profile...         配置档增删改（需绑定 KV）
+ *   /                   Web 控制台（@ui-sdk/web 零构建单文件）
+ *   /re?url=...         临时直连转换（不依赖 KV，不受 ADMIN_PASS 限制）
+ *   /s/<id>?k=<key>     KV 配置档固定短链（不受 ADMIN_PASS 限制）
+ *   /api/health         运行状态检查
+ *   /api/auth           ADMIN_PASS 登录校验（仅在配置 ADMIN_PASS 时启用）
+ *   /api/logout         退出管理登录
+ *   /api/profile        KV 配置档增删改查
+ *   /api/preview        真实拉取、缺类型检测与结果文件预览
  *
  * 环境变量（全部可选）：
- *   SpeedSub_KV   KV namespace binding 名。未绑定时全站降级为「手动模式」，
- *                页面与 /re 一切功能正常，只是没有配置档与短地址。
+ *   SpeedSub_KV         KV namespace binding 名（未绑定自动降级手动模式）
+ *   ADMIN_PASS          管理页口令保护（未设置时免登录，/api/profile 直接返回完整短链）
  */
 
-const KV绑定名 = 'SpeedSub_KV';
-const 配置键前缀 = 'prof:';
-const 配置索引键 = 'prof:index';
+const KV_BINDING = 'SpeedSub_KV';
+const PROFILE_PREFIX = 'prof:';
+const PROFILE_INDEX_KEY = 'prof:index';
+const ADMIN_COOKIE_NAME = 'speedsub_admin';
 
-// 可改写地址的 URI 类节点协议
-const 支持协议 = [
-	'vless', 'trojan', 'ss', 'ssr', 'hysteria', 'hysteria2', 'hy2',
-	'tuic', 'anytls', 'wireguard', 'socks', 'snell', 'mieru', 'juicity'
+const SUPPORTED_URI_PROTOCOLS = new Set([
+	'vless', 'vmess', 'trojan', 'ss', 'ssr',
+	'hysteria', 'hysteria2', 'hy2', 'tuic', 'anytls',
+	'wireguard', 'socks', 'snell', 'mieru', 'juicity'
+]);
+
+const CF_ELIGIBLE_TYPES = new Set(['vless', 'vmess', 'trojan']);
+const CF_CDN_NETWORKS = new Set(['ws', 'grpc', 'xhttp', 'httpupgrade', 'splithttp']);
+
+const TLS_PORTS = new Set([443, 2053, 2083, 2087, 2096, 8443]);
+const NOTLS_PORTS = new Set([80, 8080, 8880, 2052, 2082, 2086, 2095]);
+const ALL_CF_PORTS = new Set([...TLS_PORTS, ...NOTLS_PORTS]);
+
+const INFO_NODE_KEYWORDS = [
+	'剩余', '过期', '到期', '还剩', '流量', '重置', '官网', '套餐',
+	'网址', '失联', '公告', '通知', '续费', '订阅', '客服', '群组',
+	'expire', 'remaining', 'expirein', 'traffic', 'reset', 'official'
 ];
 
-// ---------------- 基础工具 ----------------
+// Cloudflare 官方 IPv4 / IPv6 CIDR
+const CF_IPV4_CIDRS = [
+	'173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+	'141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+	'197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+	'104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22'
+];
 
-function 切分列表(内容) {
-	var 文本 = (内容 || '').replace(/[\t|"'\r\n]+/g, ',').replace(/,+/g, ',');
-	if (文本.charAt(0) == ',') 文本 = 文本.slice(1);
-	if (文本.charAt(文本.length - 1) == ',') 文本 = 文本.slice(0, -1);
-	return 文本.split(',').map(s => s.trim()).filter(s => s !== '');
-}
+const CF_IPV6_CIDRS = [
+	'2400:cb00::/32', '2606:4700::/32', '2803:f800::/32',
+	'2405:b500::/32', '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32'
+];
 
-function base64解码(文本) {
-	try {
-		let 干净 = (文本 || '').trim().replace(/[\r\n\s]/g, '').replace(/-/g, '+').replace(/_/g, '/');
-		while (干净.length % 4 !== 0) 干净 += '=';
-		const 二进制 = atob(干净);
-		const 字节 = new Uint8Array(二进制.length);
-		for (let i = 0; i < 二进制.length; i++) 字节[i] = 二进制.charCodeAt(i);
-		return new TextDecoder('utf-8').decode(字节);
-	} catch {
-		return null;
-	}
-}
+const KNOWN_CF_DOMAINS = [
+	'workers.dev', 'pages.dev', 'cloudflare.com',
+	'visa.com', 'visa.cn', 'visa.com.sg', 'visa.com.hk', 'visa.com.tw', 'visa.co.jp',
+	'icook.hk', 'icook.tw', 'shopify.com', 'time.is', 'ip.sb', 'skk.moe',
+	'cf.090227.xyz', 'cf.877774.xyz', 'bestcf.top', 'bestproxy.onecf.eu.org',
+	'cdn.xn--b6gac.eu.org', 'edgetunnel.anycast.eu.org', 'cloudflare.182682.xyz',
+	'www.wto.org', 'www.csgo.com', 'www.shopify.com', 'japan.com', 'singapore.com', 'russia.com'
+];
 
-function utf8ToBase64(文本) {
-	return btoa(unescape(encodeURIComponent(文本)));
-}
-
-function 随机ID() {
-	return crypto.randomUUID().replace(/-/g, '').slice(0, 10);
-}
-
-function 随机密钥() {
-	const 字节 = new Uint8Array(24);
-	crypto.getRandomValues(字节);
-	return Array.from(字节, b => b.toString(16).padStart(2, '0')).join('');
-}
-
-/*
- * 拉取源订阅时的 User-Agent 预设：
- * 很多自适应订阅按拉取端 UA 区分返回内容（UA 含 clash → 返回 Clash YAML，否则返回 base64 节点列表）。
- * auto = 跟随实际拉取的客户端；也可填任意自定义 UA 字符串。
- */
-const 拉取UA预设 = {
-	clash: 'clash-verge/v2.0.0',
-	mihomo: 'mihomo/1.19.28',
+// 拉取源 UA 预设：Clash 固定为 clash.meta（实测可拿到真实 mihomo/clash YAML，避免占位节点）
+const PULL_UA_PRESETS = {
+	clash: 'clash.meta',
 	v2rayng: 'v2rayNG/1.9.16',
 	v2rayn: 'v2rayN/7.13.5',
 	surge: 'Surge iOS/3374',
 	shadowrocket: 'Shadowrocket/2.2.55'
 };
 
-function 解析拉取UA(pullua, 客户端UA) {
-	const v = (pullua || '').trim();
-	if (!v || v === 'auto') {
-		// auto = 按客户端类型映射到预设；未知客户端（curl/探活/浏览器）兜底 v2rayn，
-		// 避免把无特征 UA 原样转发给自适应订阅导致 403
-		const ua = (客户端UA || '').toLowerCase();
-		if (ua.includes('clash') || ua.includes('mihomo') || ua.includes('stash')) return 拉取UA预设.clash;
-		if (ua.includes('v2rayng') || ua.includes('v2rayn') || ua.includes('xray') || ua.includes('sing-box')) return 拉取UA预设.v2rayng;
-		if (ua.includes('surge')) return 拉取UA预设.surge;
-		if (ua.includes('shadowrocket')) return 拉取UA预设.shadowrocket;
-		return 拉取UA预设.v2rayn;
-	}
-	return 拉取UA预设[v.toLowerCase()] || v;
+const RANDOM_UA_POOL = [
+	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+	'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0'
+];
+
+// ---------------- 基础工具 ----------------
+
+function stripBom(text) {
+	return String(text || '').replace(/^\uFEFF/, '');
 }
 
-async function 拉取远程(地址, UA, 超时毫秒) {
-	const 控制器 = new AbortController();
-	const 定时器 = setTimeout(() => 控制器.abort(), 超时毫秒 || 8000);
+function safeDecode(text) {
 	try {
-		const 响应 = await fetch(地址, {
-			headers: { 'User-Agent': UA || 'v2rayN/7.13.5', Accept: '*/*' },
-			signal: 控制器.signal
+		return decodeURIComponent(String(text == null ? '' : text));
+	} catch {
+		return String(text == null ? '' : text);
+	}
+}
+
+function base64Decode(text) {
+	try {
+		let clean = stripBom(text).trim().replace(/[\r\n\s]/g, '').replace(/-/g, '+').replace(/_/g, '/');
+		if (!clean || !/^[A-Za-z0-9+/=]+$/.test(clean)) return null;
+		while (clean.length % 4 !== 0) clean += '=';
+		const bin = atob(clean);
+		const bytes = new Uint8Array(bin.length);
+		for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+		return new TextDecoder('utf-8').decode(bytes);
+	} catch {
+		return null;
+	}
+}
+
+function utf8ToBase64(text) {
+	const bytes = new TextEncoder().encode(String(text || ''));
+	let bin = '';
+	const chunk = 0x8000;
+	for (let i = 0; i < bytes.length; i += chunk) {
+		bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+	}
+	return btoa(bin);
+}
+
+function randomId() {
+	return crypto.randomUUID().replace(/-/g, '').slice(0, 10);
+}
+
+function randomKey() {
+	const bytes = new Uint8Array(24);
+	crypto.getRandomValues(bytes);
+	return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function resolvePullUA(pullua, clientUA) {
+	const v = String(pullua || 'clash').trim();
+	const lower = v.toLowerCase();
+	if (lower === 'auto') {
+		const ua = String(clientUA || '').toLowerCase();
+		if (ua.includes('clash') || ua.includes('mihomo') || ua.includes('stash') || ua.includes('meta')) {
+			return PULL_UA_PRESETS.clash;
+		}
+		if (ua.includes('v2rayng') || ua.includes('v2rayn') || ua.includes('xray') || ua.includes('sing-box')) {
+			return PULL_UA_PRESETS.v2rayng;
+		}
+		if (ua.includes('surge')) return PULL_UA_PRESETS.surge;
+		if (ua.includes('shadowrocket')) return PULL_UA_PRESETS.shadowrocket;
+		return PULL_UA_PRESETS.clash;
+	}
+	if (lower === 'clash' || lower === 'mihomo' || lower === 'clash.meta') {
+		return PULL_UA_PRESETS.clash;
+	}
+	return PULL_UA_PRESETS[lower] || PULL_UA_PRESETS.clash;
+}
+
+function normalizeGitHubRawUrl(rawUrl) {
+	const s = String(rawUrl || '').trim();
+	const m = /^https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/blob\/(.+)$/i.exec(s);
+	if (m) return `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}`;
+	return s;
+}
+
+async function fetchRemote(rawUrl, ua, timeoutMs = 10000) {
+	const targetUrl = normalizeGitHubRawUrl(rawUrl);
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const res = await fetch(targetUrl, {
+			headers: {
+				'User-Agent': ua || PULL_UA_PRESETS.clash,
+				'Accept': '*/*'
+			},
+			redirect: 'follow',
+			signal: controller.signal
 		});
-		if (!响应.ok) throw new Error('HTTP ' + 响应.status);
-		return await 响应.text();
+		if (!res.ok) throw new Error('HTTP ' + res.status);
+		return stripBom(await res.text());
 	} finally {
-		clearTimeout(定时器);
+		clearTimeout(timer);
 	}
 }
 
-// ---------------- 实测列表解析 ----------------
-
-/*
- * 支持写法：
- *   1.2.3.4:443
- *   1.2.3.4:443#香港-01
- *   1.2.3.4
- *   [2001:db8::1]:443#日本
- *   2001:db8::1
- *   cf.example.com:443
- * 返回 { host, port, name }，port 为 null 表示未指定（沿用节点原端口）。
- */
-function 解析实测条目(原文) {
-	let 内容 = (原文 || '').trim();
-	if (!内容) return null;
-
-	let 名称 = '';
-	const 井号 = 内容.indexOf('#');
-	if (井号 >= 0) {
-		名称 = 内容.slice(井号 + 1).trim();
-		内容 = 内容.slice(0, 井号).trim();
-	}
-	if (!内容) return null;
-
-	let host = '', port = null;
-	if (内容.startsWith('[')) {
-		const 右 = 内容.indexOf(']');
-		if (右 < 0) return null;
-		host = 内容.slice(1, 右);
-		const 余 = 内容.slice(右 + 1);
-		if (余.startsWith(':')) port = parseInt(余.slice(1), 10) || null;
-	} else {
-		const 冒号数 = (内容.match(/:/g) || []).length;
-		const 末冒号 = 内容.lastIndexOf(':');
-		if (冒号数 === 1) {
-			host = 内容.slice(0, 末冒号);
-			port = parseInt(内容.slice(末冒号 + 1), 10) || null;
-		} else if (冒号数 >= 8 && /^\d{1,5}$/.test(内容.slice(末冒号 + 1)) && Number(内容.slice(末冒号 + 1)) <= 65535) {
-			// 裸 IPv6:端口（无方括号）：完整 IPv6 最多 7 个冒号，第 8 个冒号必是端口分隔符
-			host = 内容.slice(0, 末冒号);
-			port = parseInt(内容.slice(末冒号 + 1), 10);
-		} else {
-			host = 内容; // 裸 IPv6（≤7 个冒号）或域名
-		}
-	}
-	if (!host) return null;
-	return { host: host, port: port, name: 名称 };
-}
-
-function 取端口(条目, 原端口) {
-	if (条目.port != null) return 条目.port;
-	if (原端口 != null && parseInt(原端口)) return parseInt(原端口, 10);
-	return 443;
-}
-
-// ---------------- 节点解析与改写 ----------------
-
-function 找权威结束位置(剩余) {
-	for (let i = 0; i < 剩余.length; i++) {
-		const c = 剩余[i];
-		if (c === '/' || c === '?' || c === '#') return i;
-	}
-	return 剩余.length;
-}
-
-function 取原端口(权威) {
-	if (权威.startsWith('[')) {
-		const 右 = 权威.indexOf(']');
-		const 余 = 权威.slice(右 + 1);
-		return 余.startsWith(':') ? (parseInt(余.slice(1), 10) || null) : null;
-	}
-	const 冒号数 = (权威.match(/:/g) || []).length;
-	const 末冒号 = 权威.lastIndexOf(':');
-	if (冒号数 === 1 && 末冒号 > 0) return parseInt(权威.slice(末冒号 + 1), 10) || null;
-	return null;
-}
-
-/*
- * Cloudflare 的端口族：TLS 端口(443/2053/2083/2087/2096/8443) 必须走 TLS，
- * HTTP 端口(80/8080/8880/2052/2082/2086/2095) 必须明文。
- * 实测列表的端口与源节点的 TLS 属性可能不一致，替换端口时自动对齐，否则必然连不上。
- */
-const TLS端口 = ['443', '2053', '2083', '2087', '2096', '8443'];
-
-// 信息节点（有效期/流量展示占位节点）按名称关键词识别：原样保留，不参与配对
-const 信息节点关键词 = ['剩余', '过期', '到期', '还剩', '流量', '重置', '官网', '套餐', 'expire', 'remaining', 'expirein', 'traffic'];
-
-function 是信息节点(名称) {
-	const t = String(名称 || '').toLowerCase();
+function isInfoNode(name) {
+	const t = String(name || '').toLowerCase();
 	if (!t) return false;
-	return 信息节点关键词.some(k => t.includes(k.toLowerCase()));
-}
-const HTTP端口 = ['80', '8080', '8880', '2052', '2082', '2086', '2095'];
-
-function 解析查询参数(查询) {
-	const 列表 = [];
-	(查询 || '').split('&').filter(Boolean).forEach(kv => {
-		const i = kv.indexOf('=');
-		const k = i < 0 ? kv : kv.slice(0, i);
-		const v = i < 0 ? '' : kv.slice(i + 1);
-		try { 列表.push([k, decodeURIComponent(v)]); } catch { 列表.push([k, v]); }
-	});
-	return 列表;
+	return INFO_NODE_KEYWORDS.some(k => t.includes(k));
 }
 
-function 重建查询参数(列表) {
-	return 列表.map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');
-}
-
-/*
- * 按端口类型修正节点 TLS 属性：
- *   端口是 TLS 端口而节点未启用 TLS → 补 security=tls 并带 sni；
- *   端口是明文端口而节点是 TLS → 去掉 security/sni。
- * reality 节点不触碰（换端口也救不了它，保持原样）。返回修正后的查询串。
- */
-function 按端口修正查询TLS(查询, 端口, 条目, 协议) {
-	const 参数 = 解析查询参数(查询);
-	const 取 = k => { const 项 = 参数.find(([a]) => a === k); return 项 ? 项[1] : ''; };
-	const 设 = (k, v) => { const 项 = 参数.find(([a]) => a === k); if (项) 项[1] = v; else 参数.push([k, v]); };
-	const 删 = k => { const i = 参数.findIndex(([a]) => a === k); if (i >= 0) 参数.splice(i, 1); };
-
-	const 原安全 = 取('security').toLowerCase();
-	if (协议 !== 'trojan' && 原安全 !== 'reality') {
-		if (TLS端口.includes(String(端口)) && 原安全 !== 'tls') {
-			设('security', 'tls');
-			if (!取('sni') && 取('host')) 设('sni', 取('host'));
-		} else if (HTTP端口.includes(String(端口)) && 原安全 === 'tls') {
-			删('security');
-			删('sni');
-		}
-	}
-	return 重建查询参数(参数);
-}
-
-function 解析节点(行) {
-	const 文本 = (行 || '').trim();
-	if (!文本) return null;
-	const 匹配 = /^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\/(.+)$/.exec(文本);
-	if (!匹配) return null;
-	const 协议 = 匹配[1].toLowerCase();
-	if (协议 === 'vmess') return { 协议, 类型: 'vmess', 原始: 文本 };
-	if (协议 === 'ssr') return { 协议, 类型: 'ssr', 原始: 文本 };
-	if (!支持协议.includes(协议)) return null;
-	return { 协议, 类型: 'uri', 原始: 文本 };
-}
-
-/*
- * URI 类通用改写：只替换 authority 中的 host:port 与 #fragment，
- * userinfo、路径、query 一律保持原样。
- */
-function 改写URI(节点, 条目, TLS对齐) {
-	const 原始 = 节点.原始;
-	const 斜杠 = 原始.indexOf('://');
-	const 前缀 = 原始.slice(0, 斜杠 + 3);
-	const 剩余 = 原始.slice(斜杠 + 3);
-
-	const 结束 = 找权威结束位置(剩余);
-	let 权威 = 剩余.slice(0, 结束);
-	let 尾部 = 剩余.slice(结束);
-
-	const 井号 = 尾部.indexOf('#');
-	if (井号 >= 0) 尾部 = 尾部.slice(0, 井号);
-
-	let 用户信息 = '';
-	const at = 权威.lastIndexOf('@');
-	if (at >= 0) {
-		用户信息 = 权威.slice(0, at + 1);
-		权威 = 权威.slice(at + 1);
-	} else {
-		// ss:// 旧式整体 base64：method:pass@host:port
-		const 解码 = base64解码(权威);
-		if (解码 && 解码.includes('@')) {
-			const at2 = 解码.lastIndexOf('@');
-			用户信息 = utf8ToBase64(解码.slice(0, at2 + 1)).replace(/=+$/, '') + '@';
-			权威 = 解码.slice(at2 + 1);
-		}
-	}
-
-	const 端口 = 取端口(条目, 取原端口(权威));
-	const 主机 = 条目.host.includes(':') ? '[' + 条目.host + ']' : 条目.host;
-	const 名称 = 条目.name ? 条目.name : 条目.host + ':' + 端口;
-
-	// 按端口类型对齐 TLS 属性
-	const 问号 = 尾部.indexOf('?');
-	const 路径 = 问号 >= 0 ? 尾部.slice(0, 问号) : 尾部;
-	const 修正查询 = TLS对齐 ? 按端口修正查询TLS(问号 >= 0 ? 尾部.slice(问号 + 1) : '', 端口, 条目, 节点.协议) : (问号 >= 0 ? 尾部.slice(问号 + 1) : '');
-	const 新尾部 = 路径 + (修正查询 ? '?' + 修正查询 : '');
-
-	return 前缀 + 用户信息 + 主机 + ':' + 端口 + 新尾部 + '#' + encodeURIComponent(名称);
-}
-
-/* vmess://base64(JSON)：只改 add / port / ps 三个字段 */
-function 改写VMess(节点, 条目, TLS对齐) {
-	const 体 = 节点.原始.slice('vmess://'.length).split('#')[0].trim();
-	const 解码 = base64解码(体);
-	if (!解码) return null;
-	let 配置;
-	try {
-		配置 = JSON.parse(解码);
-	} catch {
-		return null;
-	}
-	if (!配置 || typeof 配置 !== 'object') return null;
-
-	const 端口 = 取端口(条目, parseInt(配置.port, 10) || null);
-	配置.add = 条目.host;
-	配置.port = String(端口);
-	配置.ps = 条目.name ? 条目.name : 条目.host + ':' + 端口;
-
-	// 按端口类型对齐 TLS 属性（vmess JSON：tls 字段 + sni）
-	const 当前TLS = 配置.tls === 'tls' || 配置.tls === true;
-	if (TLS对齐 && TLS端口.includes(String(端口)) && !当前TLS) {
-		配置.tls = 'tls';
-		if (!配置.sni) 配置.sni = 配置.host || 条目.host;
-	} else if (TLS对齐 && HTTP端口.includes(String(端口)) && 当前TLS) {
-		配置.tls = '';
-		delete 配置.sni;
-	}
-	return 'vmess://' + utf8ToBase64(JSON.stringify(配置));
-}
-
-/* ssr://base64(host:port:protocol:method:obfs:password/?params) */
-function 改写SSR(节点, 条目) {
-	const 体 = 节点.原始.slice('ssr://'.length).split('#')[0].trim();
-	const 解码 = base64解码(体);
-	if (!解码) return null;
-	const 段 = 解码.split(':');
-	if (段.length < 2) return null;
-	段[0] = 条目.host;
-	段[1] = String(取端口(条目, parseInt(段[1], 10) || null));
-	return 'ssr://' + utf8ToBase64(段.join(':'));
-}
-
-function 改写节点(节点, 条目, TLS对齐) {
-	try {
-		if (节点.类型 === 'vmess') return 改写VMess(节点, 条目, TLS对齐);
-		if (节点.类型 === 'ssr') return 改写SSR(节点, 条目);
-		return 改写URI(节点, 条目, TLS对齐);
-	} catch {
-		return null;
-	}
-}
-
-// ---------------- 节点列表（base64 / 明文）改写 ----------------
-
-// 判断文本里是否出现形如 xxx:// 的协议链接
-function 像协议链接(文本) {
-	return /^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//m.test(文本 || '');
-}
-
-// 规范化源订阅：返回 { 文本, 格式('yaml'|'base64'|'plain') }
-// 关键顺序：先识别明文 YAML / 协议链接，只有「整段都由 base64 字符组成」才尝试解码，
-// 避免把节点链接误当作 base64 解码。
-function 规范化源(源文本) {
-	const 去头 = (源文本 || '').trim();
-	if (!去头) return { 文本: '', 格式: 'plain' };
-
-	if (/^\s*proxies\s*:/m.test(去头)) return { 文本: 源文本, 格式: 'yaml' };
-	if (像协议链接(去头)) return { 文本: 源文本, 格式: 'plain' };
-
-	if (去头.length > 16 && /^[A-Za-z0-9+/=_\-\r\n\s]+$/.test(去头)) {
-		const 解码 = base64解码(去头);
-		if (解码) {
-			if (/^\s*proxies\s*:/m.test(解码)) return { 文本: 解码, 格式: 'yaml' };
-			if (像协议链接(解码)) return { 文本: 解码, 格式: 'base64' };
-		}
-	}
-
-	return { 文本: 源文本, 格式: 'plain' };
-}
-
-function 改写节点列表(明文, 条目列表, TLS对齐) {
-	const 行数组 = 明文.split(/\r?\n/).filter(l => l.trim() !== '');
-	const 可改写 = [];
-	const 透传 = [];
-
-	for (const 行 of 行数组) {
-		const 节点 = 解析节点(行);
-		if (!节点) { 透传.push(行); continue; }
-		// 信息节点（剩余/到期等）原样保留，不占用配对位置
-		if (是信息节点(取节点名称(行))) { 透传.push(行); continue; }
-		可改写.push(节点);
-	}
-
-	if (!可改写.length) return null;
-
-	const 输出 = [];
-	for (let i = 0; i < 条目列表.length; i++) {
-		const 节点 = 可改写[i] || 可改写[0]; // 溢出用第一个节点作模板
-		const 改写后 = 改写节点(节点, 条目列表[i], TLS对齐);
-		if (改写后) 输出.push(改写后);
-	}
-
-	return 输出.concat(透传).join('\n');
-}
-
-// ---------------- clash YAML 改写（支持块式与流式两种写法） ----------------
-
-function 记录Clash字段(节点, 键, 值, 行号) {
-	if (键 === 'name') 节点.name = { 行号, 值 };
-	else if (键 === 'server') 节点.server = { 行号, 值 };
-	else if (键 === 'port') 节点.port = { 行号, 值 };
-	else if (键 === 'tls') 节点.tls = { 行号, 值 };
-	else if (键 === 'servername') 节点.servername = { 行号, 值 };
-	else if (键 === 'type') 节点.type = { 行号, 值 };
-	else if (键 === 'network') 节点.network = { 行号, 值 };
-}
-
-/* 流式（inline {a: b, c: d}）字段读写 */
-function 读Flow字段(行, 键) {
-	const m = new RegExp('\\b' + 键 + '\\s*:\\s*("(?:[^"\\\\]|\\\\.)*"|\'(?:[^\']|\\\\.)*\'|[^,}]+)').exec(行);
-	return m ? m[1].trim() : null;
-}
-
-function 替换Flow值(行, 键, 新值) {
-	const 正则 = new RegExp('(\\b' + 键 + '\\s*:\\s*)("(?:[^"\\\\]|\\\\.)*"|\'(?:[^\']|\\\\.)*\'|[^,}]+)');
-	if (!正则.test(行)) return 行;
-	return 行.replace(正则, (m, 前缀) => 前缀 + yaml标量(新值));
-}
-
-function 添加Flow键(行, 键, 新值) {
-	return 行.replace(/\}\s*$/, ', ' + 键 + ': ' + yaml标量(新值) + ' }');
-}
-
-function 删除Flow键(行, 键) {
-	return 行.replace(new RegExp(',?\\s*\\b' + 键 + '\\s*:\\s*("(?:[^"\\\\]|\\\\.)*"|\'(?:[^\']|\\\\.)*\'|[^,}]+)'), '');
-}
-
-function 提取FlowHost(行) {
-	const m = /\bHost\s*:\s*("[^"]*"|[^,}]+)/.exec(行);
-	if (!m) return null;
-	let v = m[1].replace(/^["']|["']$/g, '');
-	try { v = decodeURIComponent(v); } catch { }
-	return v;
-}
-
-function 找Clash节点(行数组) {
-	let 起始 = -1;
-	for (let i = 0; i < 行数组.length; i++) {
-		if (/^\s*proxies\s*:/.test(行数组[i])) { 起始 = i + 1; break; }
-	}
-	if (起始 < 0) return [];
-
-	const 节点 = [];
-	let 当前 = null;
-	for (let i = 起始; i < 行数组.length; i++) {
-		const 行 = 行数组[i];
-		if (行.trim() === '' || 行.trim().startsWith('#')) continue;
-		if (!/^\s/.test(行)) break; // 顶层键，proxies 段结束
-		const 项匹配 = /^(\s*)-(\s)(.*)$/.exec(行);
-		if (项匹配) {
-			if (当前) 当前.结束行 = i - 1;
-			const 流式 = 项匹配[3].trim().startsWith('{');
-			当前 = { 起始行: i, 流式: 流式, 行号: i };
-			节点.push(当前);
-			if (流式) {
-				['name', 'server', 'port', 'tls', 'servername', 'type', 'network'].forEach(k => {
-					const v = 读Flow字段(项匹配[3], k);
-					if (v != null) 记录Clash字段(当前, k, v, i);
-				});
-			} else {
-				const 首键 = /^\s*([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(项匹配[3]);
-				if (首键) 记录Clash字段(当前, 首键[1], 首键[2], i);
-			}
-			continue;
-		}
-		if (当前 && !当前.流式) {
-			const 键 = /^\s*([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(行);
-			if (键) 记录Clash字段(当前, 键[1], 键[2], i);
-		}
-	}
-	// 最后一个节点也只算到文件尾：若有后续顶层段（proxy-groups/rules 等），结束行应为
-	// 「该节点末行」，即 proxies 段结束（下一个顶层键之前）——由下面的顶层键检测兜底，
-	// 这里仅当节点真的是文件最后一项时才等于 length-1。
-	// 实现：结束行 = 从节点起始行向后找，遇到第一个非空行且缩进 <= 节点项缩进的行之前。
-	if (当前) {
-		let 终 = 行数组.length - 1;
-		for (let j = 当前.起始行 + 1; j < 行数组.length; j++) {
-			const l = 行数组[j];
-			if (l.trim() === '' || l.trim().startsWith('#')) continue;
-			if (!/^\s/.test(l)) { 终 = j - 1; break; } // 下一个顶层键：本节点结束于前一行
-		}
-		当前.结束行 = 终;
-	}
-	return 节点;
-}
-
-function 替换Yaml值(行, 键, 新值) {
-	const 正则 = new RegExp('(^\\s*(?:- )?\\s*' + 键 + '\\s*:\\s*)(.*)$');
-	return 行.replace(正则, (全部, 前缀, 旧值) => {
-		const 引号 = /^(["'])([\s\S]*)\1$/.exec(旧值.trim());
-		const 内容 = 引号 ? 引号[1] + 新值 + 引号[1] : 新值;
-		return 前缀 + 内容;
-	});
-}
-
-function 找Clash块内Host(行数组, 起始, 结束) {
-	for (let i = 起始; i <= 结束 && i < 行数组.length; i++) {
-		const 匹配 = /^\s*Host\s*:\s*(.+?)\s*$/.exec(行数组[i]);
-		if (匹配) {
-			let 值 = 匹配[1].replace(/^["']|["']$/g, '');
-			try { 值 = decodeURIComponent(值); } catch { }
-			return 值;
-		}
-	}
-	return null;
-}
-
-function 改写Clash配置(文本, 条目列表, TLS对齐) {
-	const 行数组 = 文本.split('\n');
-	const 节点列表 = 找Clash节点(行数组).filter(n => n.server);
-	if (!节点列表.length) return null;
-
-	const 已用名 = new Set();
-	const 新旧名 = [];
-	const 待插入 = [];
-	const 待删除 = [];
-	const 保留名 = new Set();
-
-	// 信息节点（剩余/到期等）原样保留：不参与配对，也不被删除
-	const 信息节点集 = new Set();
-	const 真实节点 = [];
-	for (const 节点 of 节点列表) {
-		if (节点.name && 是信息节点(String(节点.name.值).replace(/^["']|["']$/g, ''))) 信息节点集.add(节点);
-		else 真实节点.push(节点);
-	}
-
-	for (let i = 0; i < 条目列表.length; i++) {
-		const 条目 = 条目列表[i];
-		const 节点 = 真实节点[i] || 真实节点[0]; // 溢出用第一个真实节点作模板
-		if (!节点) break;
-
-		const 原端口 = 节点.port ? parseInt(String(节点.port.值).replace(/["']/g, ''), 10) : null;
-		const 端口 = 取端口(条目, 原端口);
-		const 名称 = 条目.name ? 条目.name : 条目.host + ':' + 端口;
-
-		let 唯一 = 名称, 序号 = 2;
-		while (已用名.has(唯一)) { 唯一 = 名称 + '-' + 序号; 序号++; }
-		已用名.add(唯一);
-		保留名.add(唯一);
-
-		const 类型 = 节点.type ? String(节点.type.值).replace(/["']/g, '').trim() : '';
-
-		if (节点.流式) {
-			let 行文本 = 行数组[节点.行号];
-			行文本 = 替换Flow值(行文本, 'name', 唯一);
-			行文本 = 替换Flow值(行文本, 'server', 条目.host);
-			行文本 = 替换Flow值(行文本, 'port', 端口);
-			if (TLS对齐 && /^(vless|vmess)$/i.test(类型)) {
-				const 期望TLS = TLS端口.includes(String(端口));
-				const 当前声明 = 节点.tls && /^"?true"?$/i.test(String(节点.tls.值).replace(/["']/g, '').trim());
-				if (期望TLS && !当前声明) 行文本 = 替换Flow值(行文本, 'tls', true);
-				if (!期望TLS && 当前声明) 行文本 = 替换Flow值(行文本, 'tls', false);
-				if (!期望TLS) 行文本 = 删除Flow键(行文本, 'servername');
-				const 域名 = 提取FlowHost(行文本) || (节点.servername ? String(节点.servername.值).replace(/^["']/g, '') : null);
-				if (期望TLS && 域名 && !读Flow字段(行文本, 'servername')) 行文本 = 添加Flow键(行文本, 'servername', 域名);
-			}
-			行数组[节点.行号] = 行文本;
-		} else {
-			if (节点.name && 节点.name.行号 >= 0) 行数组[节点.name.行号] = 替换Yaml值(行数组[节点.name.行号], 'name', 唯一);
-			行数组[节点.server.行号] = 替换Yaml值(行数组[节点.server.行号], 'server', 条目.host);
-			if (节点.port) 行数组[节点.port.行号] = 替换Yaml值(行数组[节点.port.行号], 'port', 端口);
-		}
-
-		// TLS 一致性对齐（块式节点）：源节点、实测端口族、最终配置三者必须一致
-		if (TLS对齐 && !节点.流式 && 节点.port && /^(vless|vmess)$/i.test(类型)) {
-			const 期望TLS = TLS端口.includes(String(端口));
-			const 节点声明TLS = 节点.tls && /^(true|yes)$/i.test(String(节点.tls.值).trim());
-
-			if (期望TLS && !节点声明TLS) {
-				if (节点.tls) {
-					行数组[节点.tls.行号] = 替换Yaml值(行数组[节点.tls.行号], 'tls', true);
-				} else {
-					const 插入行号 = 节点.port.行号;
-					const 缩进 = (/^(\s*)/.exec(行数组[插入行号]) || ['', ''])[1];
-					const 文本列表 = [缩进 + 'tls: true'];
-					const 域名 = 找Clash块内Host(行数组, 节点.起始行, 节点.结束行);
-					if (域名 && !节点.servername) 文本列表.push(缩进 + 'servername: ' + 域名);
-					待插入.push({ 行号: 插入行号, 文本: 文本列表 });
-				}
-			} else if (!期望TLS && 节点声明TLS) {
-				行数组[节点.tls.行号] = 替换Yaml值(行数组[节点.tls.行号], 'tls', false);
-				if (节点.servername) 待删除.push(节点.servername.行号);
-			} else if (!期望TLS && !节点.tls) {
-				const 插入行号 = 节点.port.行号;
-				const 缩进 = (/^(\s*)/.exec(行数组[插入行号]) || ['', ''])[1];
-				待插入.push({ 行号: 插入行号, 文本: [缩进 + 'tls: false'] });
-			}
-		}
-
-		const 原名 = 节点.name ? String(节点.name.值).replace(/^["']|["']$/g, '') : null;
-		if (原名 && 原名 !== 唯一) 新旧名.push([原名, 唯一]);
-	}
-
-	// 多余的真实节点（真实节点数 > 实测条数）：整条删除，让 proxies 只剩实测条数
-	// 信息节点原样保留
-	const 配对节点集 = new Set();
-	for (let i = 0; i < 条目列表.length && i < 真实节点.length; i++) 配对节点集.add(真实节点[i]);
-	const 删除行集合 = [];
-	for (const 节点 of 真实节点) {
-		if (配对节点集.has(节点)) continue;
-		if (节点.流式) 删除行集合.push(节点.行号);
-		else {
-			for (let i = 节点.起始行; i <= 节点.结束行; i++) 删除行集合.push(i);
-		}
-	}
-	// 信息节点不在 真实节点 列表里，因此不会进入删除集合
-
-	// 行级插入/删除从后往前应用，避免行号位移
-	const 操作 = [];
-	待删除.forEach(行号 => 操作.push({ 行号, 删除: true }));
-	删除行集合.forEach(行号 => 操作.push({ 行号, 删除: true }));
-	待插入.forEach(o => 操作.push({ 行号: o.行号, 文本: o.文本 }));
-	操作.sort((a, b) => b.行号 - a.行号);
-	for (const op of 操作) {
-		if (op.删除) 行数组.splice(op.行号, 1);
-		else 行数组.splice(op.行号 + 1, 0, ...op.文本);
-	}
-
-	// 被删除的多余节点：其 proxy-groups 成员引用也要移除
-	const 删除节点旧名 = [];
-	for (const 节点 of 节点列表) {
-		if (信息节点集.has(节点)) continue;
-		if (配对节点集.has(节点)) continue;
-		if (!节点.name) continue;
-		const 旧名 = String(节点.name.值).replace(/^["']|["']$/g, '').trim();
-		if (旧名) 删除节点旧名.push(旧名);
-	}
-
-	// 同步 proxy-groups 中的旧名称引用
-	if (新旧名.length) {
-		let 在组段 = false;
-		for (let i = 0; i < 行数组.length; i++) {
-			if (/^\s*proxy-groups\s*:/.test(行数组[i])) { 在组段 = true; continue; }
-			if (在组段) {
-				if (行数组[i].trim() === '') continue;
-				if (!/^\s/.test(行数组[i])) break;
-				for (const [旧, 新] of 新旧名) {
-					const 转义 = 旧.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-					行数组[i] = 行数组[i].replace(
-						new RegExp('^(\\s*-\\s*)(["\']?)(' + 转义 + ')\\2(\\s*,?\\s*)$'),
-						(全部, 前缀, 引号, _旧, 后缀) => 前缀 + (引号 || '') + 新 + (引号 || '') + 后缀
-					);
-				}
-			}
-		}
-	}
-
-	// 保留节点少于源时：从 proxy-groups 成员列表里移除被丢弃节点的引用
-	if (节点列表.length > 条目列表.length) {
-		const 组名 = new Set();
-		let 在组段 = false;
-		for (const l of 行数组) {
-			if (/^\s*proxy-groups\s*:/.test(l)) { 在组段 = true; continue; }
-			if (在组段) {
-				if (l.trim() === '') continue;
-				if (!/^\s/.test(l)) break;
-				const m = /^\s*-\s*name\s*:\s*(.+)$/.exec(l);
-				if (m) 组名.add(String(m[1]).replace(/^["']|["']$/g, '').trim());
-			}
-		}
-		const 特殊 = new Set(['DIRECT', 'REJECT', 'GLOBAL', 'PASS']);
-		let 在成员列表 = false;
-		const 待删成员 = [];
-		for (let i = 0; i < 行数组.length; i++) {
-			const l = 行数组[i];
-			if (/^\s*proxy-groups\s*:/.test(l)) { 在组段 = true; continue; }
-			if (!在组段) continue;
-			if (l.trim() === '') continue;
-			if (!/^\s/.test(l)) break;
-			if (/^\s*-\s*(name|type|server|url)\s*:/i.test(l)) { 在成员列表 = /proxies\s*:$/.test(l.trim()); continue; }
-			if (/proxies\s*:$/.test(l.trim())) { 在成员列表 = true; continue; }
-			if (在成员列表 && /^\s*-\s*/.test(l)) {
-				const 成员 = l.replace(/^\s*-\s*/, '').replace(/["',]/g, '').trim();
-				if (成员 && !保留名.has(成员) && !特殊.has(成员) && !组名.has(成员)) 待删成员.push(i);
-			}
-			// 删除节点（配对未用到）的旧名成员引用：精确匹配移除
-			if (删除节点旧名.length && /^\s*-\s*/.test(l)) {
-				for (const 旧名 of 删除节点旧名) {
-					const 转义 = 旧名.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-					const 正则 = new RegExp('^(\\s*-\\s*)(["\']?)' + 转义 + '\\2(\\s*,?\\s*)$');
-					if (正则.test(l)) { 待删成员.push(i); break; }
-				}
-			}
-		}
-		待删成员.sort((a, b) => b - a).forEach(i => 行数组.splice(i, 1));
-	}
-
-	return 行数组.join('\n');
-}
-
-// ---------------- 订阅输出 ----------------
-
-function 订阅头(额外) {
+function subHeaders(extra) {
 	return Object.assign({
 		'content-type': 'text/plain; charset=utf-8',
 		'Profile-Update-Interval': '6',
 		'Cache-Control': 'no-store'
-	}, 额外 || {});
+	}, extra || {});
 }
 
-// ---------------- Clash 导出（节点链接 → Clash 代理对象 → 完整配置） ----------------
+function jsonResponse(data, status = 200, extraHeaders) {
+	return new Response(JSON.stringify(data, null, 2), {
+		status,
+		headers: Object.assign({
+			'content-type': 'application/json; charset=utf-8',
+			'Cache-Control': 'no-store'
+		}, extraHeaders || {})
+	});
+}
 
-function 拆URI(链接) {
-	const 斜杠 = 链接.indexOf('://');
-	const 剩余 = 链接.slice(斜杠 + 3);
-	const 结束 = 找权威结束位置(剩余);
-	let 权威 = 剩余.slice(0, 结束);
-	let 尾部 = 剩余.slice(结束);
+// ---------------- ADMIN_PASS 鉴权 ----------------
 
-	let 片段 = '';
-	const 井号 = 尾部.indexOf('#');
-	if (井号 >= 0) { 片段 = 尾部.slice(井号 + 1); 尾部 = 尾部.slice(0, 井号); }
+function parseCookies(header) {
+	const out = {};
+	for (const part of String(header || '').split(';')) {
+		const idx = part.indexOf('=');
+		if (idx < 0) continue;
+		const k = part.slice(0, idx).trim();
+		const v = part.slice(idx + 1).trim();
+		if (k) out[k] = safeDecode(v);
+	}
+	return out;
+}
 
-	let 查询 = '', 路径 = '';
-	const 问号 = 尾部.indexOf('?');
-	if (问号 >= 0) { 查询 = 尾部.slice(问号 + 1); 路径 = 尾部.slice(0, 问号); }
-	else 路径 = 尾部;
+async function signAdminToken(pass) {
+	const enc = new TextEncoder();
+	const key = await crypto.subtle.importKey(
+		'raw', enc.encode(pass), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+	);
+	const sig = await crypto.subtle.sign('HMAC', key, enc.encode('speedsub-admin-v2'));
+	return Array.from(new Uint8Array(sig), b => b.toString(16).padStart(2, '0')).join('');
+}
 
-	let 用户信息 = '';
-	const at = 权威.lastIndexOf('@');
-	if (at >= 0) { 用户信息 = 权威.slice(0, at); 权威 = 权威.slice(at + 1); }
-	if (!用户信息) {
-		const 解码 = base64解码(权威);
-		if (解码 && 解码.includes('@')) {
-			const at2 = 解码.lastIndexOf('@');
-			用户信息 = 解码.slice(0, at2);
-			权威 = 解码.slice(at2 + 1);
+function timingSafeEqualStr(a, b) {
+	const sa = String(a || '');
+	const sb = String(b || '');
+	if (sa.length !== sb.length) return false;
+	let diff = 0;
+	for (let i = 0; i < sa.length; i++) diff |= sa.charCodeAt(i) ^ sb.charCodeAt(i);
+	return diff === 0;
+}
+
+function getAdminPass(env) {
+	return env && typeof env.ADMIN_PASS === 'string' ? env.ADMIN_PASS.trim() : '';
+}
+
+async function isAdminAuthed(request, env) {
+	const pass = getAdminPass(env);
+	if (!pass) return true;
+	const headerPass = (request.headers.get('X-Admin-Pass') || '').trim();
+	if (headerPass && timingSafeEqualStr(headerPass, pass)) return true;
+	const cookies = parseCookies(request.headers.get('Cookie') || '');
+	const token = cookies[ADMIN_COOKIE_NAME] || '';
+	if (!token) return false;
+	const expected = await signAdminToken(pass);
+	return timingSafeEqualStr(token, expected);
+}
+
+// ---------------- IP / CIDR / CF 三层识别 ----------------
+
+function parseIPv4ToInt(ip) {
+	const parts = String(ip || '').trim().split('.');
+	if (parts.length !== 4) return null;
+	let n = 0;
+	for (const p of parts) {
+		if (!/^\d{1,3}$/.test(p)) return null;
+		const v = Number(p);
+		if (v < 0 || v > 255) return null;
+		n = ((n << 8) | v) >>> 0;
+	}
+	return n;
+}
+
+function parseIPv6ToBigInt(rawIp) {
+	let ip = String(rawIp || '').trim().replace(/^\[|\]$/g, '');
+	if (!ip.includes(':')) return null;
+	const pct = ip.indexOf('%');
+	if (pct >= 0) ip = ip.slice(0, pct);
+	// IPv4-mapped IPv6 tail
+	if (ip.includes('.')) {
+		const lastColon = ip.lastIndexOf(':');
+		const v4 = parseIPv4ToInt(ip.slice(lastColon + 1));
+		if (v4 === null) return null;
+		const hi = ((v4 >>> 16) & 0xffff).toString(16);
+		const lo = (v4 & 0xffff).toString(16);
+		ip = ip.slice(0, lastColon + 1) + hi + ':' + lo;
+	}
+	const halves = ip.split('::');
+	if (halves.length > 2) return null;
+	const left = halves[0] ? halves[0].split(':') : [];
+	const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+	const missing = halves.length === 2 ? 8 - (left.length + right.length) : 0;
+	if (missing < 0 || (halves.length === 1 && left.length !== 8)) return null;
+	const groups = [...left, ...Array(missing).fill('0'), ...right];
+	if (groups.length !== 8) return null;
+	let val = 0n;
+	for (const g of groups) {
+		if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+		val = (val << 16n) | BigInt(parseInt(g, 16));
+	}
+	return val;
+}
+
+const COMPILED_CF_V4 = CF_IPV4_CIDRS.map(cidr => {
+	const [net, bitsStr] = cidr.split('/');
+	const bits = Number(bitsStr);
+	const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
+	return { base: (parseIPv4ToInt(net) & mask) >>> 0, mask };
+});
+
+const COMPILED_CF_V6 = CF_IPV6_CIDRS.map(cidr => {
+	const [net, bitsStr] = cidr.split('/');
+	const bits = BigInt(Number(bitsStr));
+	const mask = bits === 0n ? 0n : (((1n << bits) - 1n) << (128n - bits));
+	return { base: parseIPv6ToBigInt(net) & mask, mask };
+});
+
+function isCloudflareIP(ip) {
+	const clean = String(ip || '').trim().replace(/^\[|\]$/g, '');
+	if (!clean) return false;
+	const v4 = parseIPv4ToInt(clean);
+	if (v4 !== null) {
+		return COMPILED_CF_V4.some(c => ((v4 & c.mask) >>> 0) === c.base);
+	}
+	const v6 = parseIPv6ToBigInt(clean);
+	if (v6 !== null) {
+		return COMPILED_CF_V6.some(c => (v6 & c.mask) === c.base);
+	}
+	return false;
+}
+
+function isIPLiteral(host) {
+	const clean = String(host || '').trim().replace(/^\[|\]$/g, '');
+	return parseIPv4ToInt(clean) !== null || parseIPv6ToBigInt(clean) !== null;
+}
+
+function domainMatchesSuffix(host, suffix) {
+	const h = String(host || '').trim().toLowerCase().replace(/\.$/, '');
+	const s = String(suffix || '').trim().toLowerCase();
+	return h === s || h.endsWith('.' + s);
+}
+
+async function dohQueryCF(domain, cache) {
+	const d = String(domain || '').trim().toLowerCase();
+	if (!d || isIPLiteral(d)) return isCloudflareIP(d);
+	if (cache.has(d)) return cache.get(d);
+
+	const queryType = async (type) => {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 2500);
+		try {
+			const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(d)}&type=${type}`, {
+				headers: { 'Accept': 'application/dns-json' },
+				signal: controller.signal
+			});
+			if (!res.ok) return [];
+			const data = await res.json();
+			const answers = Array.isArray(data && data.Answer) ? data.Answer : [];
+			return answers.filter(a => a && (a.type === 1 || a.type === 28) && a.data).map(a => String(a.data).trim());
+		} catch {
+			return [];
+		} finally {
+			clearTimeout(timer);
 		}
+	};
+
+	const [aList, aaaaList] = await Promise.all([queryType('A'), queryType('AAAA')]);
+	const ips = [...aList, ...aaaaList];
+	const hit = ips.some(isCloudflareIP);
+	cache.set(d, hit);
+	return hit;
+}
+
+function classifyCFNodeSync(node) {
+	if (!node || !node.type) return { status: 'no', reason: 'invalid' };
+	if (isInfoNode(node.name)) return { status: 'no', reason: 'info' };
+	const type = String(node.type).toLowerCase();
+	if (!CF_ELIGIBLE_TYPES.has(type)) return { status: 'no', reason: 'excluded-type' };
+	if (node.hasReality) return { status: 'no', reason: 'reality' };
+
+	const server = String(node.server || '').trim().replace(/^\[|\]$/g, '').toLowerCase();
+	const port = Number(node.port) || 0;
+	const net = String(node.network || 'tcp').toLowerCase();
+	const host = String(node.host || '').trim().toLowerCase();
+	const sni = String(node.sni || '').trim().toLowerCase();
+
+	// 第 1 层：CF 官方 IPv4 / IPv6 CIDR
+	if (isIPLiteral(server)) {
+		if (isCloudflareIP(server)) return { status: 'yes', reason: 'cf-cidr' };
+		// IP 字面量但不在 CF 段：绝不是 CF 节点
+		return { status: 'no', reason: 'non-cf-ip' };
 	}
 
-	const 参数 = {};
-	查询.split('&').filter(Boolean).forEach(kv => {
-		const i = kv.indexOf('=');
-		const k = i < 0 ? kv : kv.slice(0, i);
-		const v = i < 0 ? '' : kv.slice(i + 1);
-		try { 参数[decodeURIComponent(k)] = decodeURIComponent(v); } catch { 参数[k] = v; }
+	// 第 2 层：域名或特征命中
+	if (domainMatchesSuffix(server, 'workers.dev') || domainMatchesSuffix(server, 'pages.dev') ||
+		domainMatchesSuffix(host, 'workers.dev') || domainMatchesSuffix(host, 'pages.dev') ||
+		domainMatchesSuffix(sni, 'workers.dev') || domainMatchesSuffix(sni, 'pages.dev')) {
+		return { status: 'yes', reason: 'cf-workers-pages' };
+	}
+
+	const isCdnTransport = CF_CDN_NETWORKS.has(net);
+	const isCfPort = ALL_CF_PORTS.has(port);
+
+	if (isCdnTransport && isCfPort && KNOWN_CF_DOMAINS.some(d => domainMatchesSuffix(server, d))) {
+		return { status: 'yes', reason: 'cf-known-domain' };
+	}
+
+	const targetDomain = host || sni;
+	if (isCdnTransport && isCfPort && targetDomain && server && server !== targetDomain) {
+		return { status: 'yes', reason: 'cf-cdn-split-host' };
+	}
+
+	// 候选进入第 3 层 DoH（仅限可走 CF CDN 的传输或 13 端口族域名）
+	if (server && server.includes('.') && (isCdnTransport || isCfPort)) {
+		return { status: 'doh', domain: server };
+	}
+
+	return { status: 'no', reason: 'not-cf' };
+}
+
+async function detectCFNodes(nodes, dohFn) {
+	const resolver = dohFn || dohQueryCF;
+	const dohCache = new Map();
+	const pendingDomains = new Set();
+	const preliminary = nodes.map(node => {
+		const res = classifyCFNodeSync(node);
+		if (res.status === 'doh' && res.domain) pendingDomains.add(res.domain);
+		return res;
 	});
 
-	return { 用户信息, 主机端口: 权威, 路径, 参数, 片段, 协议: 链接.slice(0, 斜杠).toLowerCase() };
-}
-
-function 拆主机端口(主机端口) {
-	if (主机端口.startsWith('[')) {
-		const 右 = 主机端口.indexOf(']');
-		const 余 = 主机端口.slice(右 + 1);
-		return { server: 主机端口.slice(1, 右), port: 余.startsWith(':') ? (Number(余.slice(1)) || 443) : 443 };
+	if (pendingDomains.size > 0) {
+		await Promise.allSettled(Array.from(pendingDomains).map(d => resolver(d, dohCache)));
 	}
-	const 冒号数 = (主机端口.match(/:/g) || []).length;
-	const i = 主机端口.lastIndexOf(':');
-	if (冒号数 === 1 && i > 0) return { server: 主机端口.slice(0, i), port: Number(主机端口.slice(i + 1)) || 443 };
-	return { server: 主机端口, port: 443 };
+
+	return nodes.map((node, i) => {
+		const p = preliminary[i];
+		if (p.status === 'yes') return { isCF: true, reason: p.reason };
+		if (p.status === 'doh') {
+			const hit = !!dohCache.get(p.domain);
+			return { isCF: hit, reason: hit ? 'cf-doh' : 'non-cf-doh' };
+		}
+		return { isCF: false, reason: p.reason };
+	});
 }
 
-function 安全解码(文本) {
-	try { return decodeURIComponent(String(文本 == null ? '' : 文本)); } catch { return String(文本 == null ? '' : 文本); }
+// ---------------- 输入解析：源订阅 & 多合一优选汇聚 ----------------
+
+function extractSources(rawText, legacyLink) {
+	const combined = [stripBom(rawText || ''), stripBom(legacyLink || '')].filter(Boolean).join('\n');
+	const urls = [];
+	const rawNodes = [];
+	const seenUrls = new Set();
+	const seenNodes = new Set();
+
+	for (const rawLine of combined.split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+
+		// 1. 裸代理节点（支持行内带中文注释/空格在 # 后）
+		const uriMatch = /^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\/(.+)$/.exec(line);
+		if (uriMatch && SUPPORTED_URI_PROTOCOLS.has(uriMatch[1].toLowerCase())) {
+			if (!seenNodes.has(line)) {
+				seenNodes.add(line);
+				rawNodes.push(line);
+			}
+			continue;
+		}
+
+		// 2. 提取行内所有合法 http(s):// 订阅链接（自动忽略周围中文/符号）
+		const httpMatches = line.match(/https?:\/\/[^\s"'<>|]+/gi);
+		if (httpMatches) {
+			for (let u of httpMatches) {
+				u = u.replace(/[),;，。！？\]】》]+$/g, '');
+				try {
+					const parsed = new URL(u);
+					if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+						const clean = parsed.toString();
+						if (!seenUrls.has(clean)) {
+							seenUrls.add(clean);
+							urls.push(clean);
+						}
+					}
+				} catch {
+					// 忽略非法 URL
+				}
+			}
+		}
+	}
+
+	return { urls, rawNodes };
 }
 
-const UA池 = [
-	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
-	'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
-	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
-	'Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36'
-];
-
-function 随机UA() {
-	return UA池[Math.floor(Math.random() * UA池.length)];
+function isValidHostname(host) {
+	if (!host || host.length > 253) return false;
+	if (isIPLiteral(host)) return true;
+	if (!host.includes('.')) return false;
+	return /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/.test(host);
 }
 
-function uri转Clash代理(协议, 链接, 名称, 加随机UA) {
-	const u = 拆URI(链接);
-	const hp = 拆主机端口(u.主机端口);
-	const p = u.参数;
-	const 传输 = (p.type || p.net || 'tcp').toLowerCase();
-	const 安全 = (p.security || '').toLowerCase();
-	const 代理 = { name: 名称, server: hp.server, port: hp.port };
+function parsePreferredEntry(rawLine) {
+	let line = stripBom(rawLine).trim();
+	if (!line || line.startsWith('#') || line.startsWith('//')) return null;
 
-	const 加传输 = () => {
-		if (传输 === 'ws' || 传输 === 'websocket') {
-			代理.network = 'ws';
-			代理['ws-opts'] = { path: p.path || '/' };
-			代理['ws-opts'].headers = {};
-			if (p.host) 代理['ws-opts'].headers.Host = p.host;
-			if (加随机UA) 代理['ws-opts'].headers['User-Agent'] = 随机UA();
+	// CloudflareST CSV 兼容：IP,已发送,已接收,丢包率,平均延迟,下载速度...
+	if (/^\d{1,3}(\.\d{1,3}){3},/.test(line)) {
+		const cols = line.split(',').map(s => s.trim());
+		const ip = cols[0];
+		if (parseIPv4ToInt(ip) !== null) {
+			const speed = cols[5] ? cols[5] + 'MB/s' : '';
+			return { host: ip, port: 443, name: speed || (ip + ':443') };
+		}
+	}
 
-		} else if (传输 === 'grpc') {
-			代理.network = 'grpc';
-			代理['grpc-opts'] = { 'grpc-service-name': p.serviceName || p.servicename || '' };
-		} else if (传输 === 'h2' || 传输 === 'http') {
-			代理.network = 'h2';
-			代理['h2-opts'] = { path: p.path || '/', host: [p.host || hp.server] };
+	let name = '';
+	const hashIdx = line.indexOf('#');
+	if (hashIdx >= 0) {
+		name = line.slice(hashIdx + 1).trim();
+		line = line.slice(0, hashIdx).trim();
+	}
+	if (!line) return null;
+
+	let host = '';
+	let port = 443; // 省略端口默认 443
+
+	if (line.startsWith('[')) {
+		const closeIdx = line.indexOf(']');
+		if (closeIdx < 0) return null;
+		host = line.slice(1, closeIdx).trim();
+		const rest = line.slice(closeIdx + 1).trim();
+		if (rest) {
+			if (!rest.startsWith(':')) return null;
+			const p = parseInt(rest.slice(1), 10);
+			if (!Number.isInteger(p) || p < 1 || p > 65535) return null;
+			port = p;
+		}
+	} else {
+		const colons = (line.match(/:/g) || []).length;
+		const lastColon = line.lastIndexOf(':');
+		if (colons === 1) {
+			host = line.slice(0, lastColon).trim();
+			const pStr = line.slice(lastColon + 1).trim();
+			const p = parseInt(pStr, 10);
+			if (!/^\d{1,5}$/.test(pStr) || p < 1 || p > 65535) return null;
+			port = p;
+		} else if (colons >= 8) {
+			const pStr = line.slice(lastColon + 1).trim();
+			const p = parseInt(pStr, 10);
+			if (/^\d{1,5}$/.test(pStr) && p >= 1 && p <= 65535) {
+				host = line.slice(0, lastColon).trim();
+				port = p;
+			} else {
+				return null;
+			}
 		} else {
-			代理.network = 'tcp';
+			host = line;
+			port = 443;
+		}
+	}
+
+	if (!isValidHostname(host)) return null;
+	return { host, port, name };
+}
+
+function classifyPreferredPools(entries) {
+	const tlsPool = [];
+	const noTlsPool = [];
+	const seen = new Set();
+
+	for (const e of entries) {
+		if (!e || !e.host) continue;
+		const key = `${e.host.toLowerCase()}:${e.port}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+
+		if (TLS_PORTS.has(e.port)) {
+			tlsPool.push(e);
+		} else if (NOTLS_PORTS.has(e.port)) {
+			noTlsPool.push(e);
+		}
+	}
+	return { tlsPool, noTlsPool };
+}
+
+// 切分多合一「自定义优选与汇聚」输入
+function parseAllInOneRaw(addText, legacyAddApi) {
+	const directPreferred = [];
+	const remoteUrls = [];
+	const directRawNodes = [];
+	const seenRemote = new Set();
+
+	const addRemote = (u) => {
+		const clean = u.trim();
+		if (clean && !seenRemote.has(clean)) {
+			seenRemote.add(clean);
+			remoteUrls.push(clean);
 		}
 	};
 
-	if (协议 === 'vless' || 协议 === 'trojan') {
-		代理.type = 协议;
-		if (协议 === 'vless') 代理.uuid = 安全解码(u.用户信息);
-		else 代理.password = 安全解码(u.用户信息);
-		加传输();
-		if (安全 === 'reality') {
-			代理.tls = true;
-			代理['reality-opts'] = { 'public-key': p.pbk || '', 'short-id': p.sid || '' };
-			if (p.sni) 代理.servername = p.sni;
-			if (p.fp) 代理['client-fingerprint'] = p.fp;
-		} else if (协议 === 'trojan' || 安全 === 'tls') {
-			代理.tls = true;
-			const 域名 = p.sni || p.host;
-			if (域名) 代理.servername = 域名;
-			if (p.alpn) 代理.alpn = 安全解码(p.alpn).split(',').filter(Boolean);
-			if (p.fp) 代理['client-fingerprint'] = p.fp;
-			if (p.allowInsecure === '1' || p.allowInsecure === 'true') 代理['skip-cert-verify'] = true;
-		} else {
-			// 明文节点：显式写 tls: false，与实测端口族保持一致
-			代理.tls = false;
+	if (legacyAddApi) {
+		for (const part of stripBom(legacyAddApi).split(/[\r\n,]+/)) {
+			const t = part.trim();
+			if (/^https?:\/\//i.test(t)) addRemote(t);
 		}
-		if (协议 === 'vless' && p.flow) 代理.flow = p.flow;
-		return 代理;
 	}
 
-	if (协议 === 'ss') {
-		const 凭据 = base64解码(u.用户信息) || 安全解码(u.用户信息);
-		const i = 凭据.indexOf(':');
-		代理.type = 'ss';
-		代理.cipher = i < 0 ? 凭据 : 凭据.slice(0, i);
-		代理.password = i < 0 ? '' : 凭据.slice(i + 1);
-		if (p.plugin) {
-			代理.plugin = p.plugin;
-			if (p['plugin-opts'] || p.obfs) 代理['plugin-opts'] = 安全解码(p['plugin-opts'] || ('obfs=' + p.obfs + (p['obfs-password'] ? ';obfs-password=' + p['obfs-password'] : '')));
+	const rawLines = stripBom(addText || '').split(/\r?\n/);
+	for (const rawLine of rawLines) {
+		const line = rawLine.trim();
+		if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+
+		// 1. 裸代理节点
+		const uriMatch = /^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\/(.+)$/.exec(line);
+		if (uriMatch) {
+			const proto = uriMatch[1].toLowerCase();
+			if (SUPPORTED_URI_PROTOCOLS.has(proto)) {
+				directRawNodes.push(line);
+				continue;
+			}
+			if (proto === 'sub') {
+				addRemote('https://' + uriMatch[2].trim());
+				continue;
+			}
+			if (proto === 'http' || proto === 'https') {
+				addRemote(line);
+				continue;
+			}
 		}
-		return 代理;
+
+		// 2. 兼容旧式逗号拼接的优选列表（例如 ?add=1.2.3.4:443,5.6.7.8:2053）
+		const subParts = (!line.includes('://') && line.includes(',') && !/^\d{1,3}(\.\d{1,3}){3},\d+/.test(line))
+			? line.split(',')
+			: [line];
+
+		for (const p of subParts) {
+			const item = p.trim();
+			if (!item) continue;
+			if (/^https?:\/\//i.test(item)) {
+				addRemote(item);
+				continue;
+			}
+			if (/^sub:\/\//i.test(item)) {
+				addRemote('https://' + item.slice(6).trim());
+				continue;
+			}
+			const parsed = parsePreferredEntry(item);
+			if (parsed) directPreferred.push(parsed);
+		}
 	}
 
-	if (协议 === 'hysteria2' || 协议 === 'hy2') {
-		代理.type = 'hysteria2';
-		代理.password = 安全解码(u.用户信息);
-		代理.tls = true;
-		if (p.sni) 代理.sni = p.sni;
-		if (p.insecure === '1' || p.allowInsecure === '1') 代理['skip-cert-verify'] = true;
-		if (p.obfs) 代理.obfs = p.obfs;
-		if (p['obfs-password']) 代理['obfs-password'] = p['obfs-password'];
-		return 代理;
-	}
-
-	if (协议 === 'tuic') {
-		const 凭据 = 安全解码(u.用户信息);
-		const i = 凭据.indexOf(':');
-		代理.type = 'tuic';
-		代理.uuid = i < 0 ? 凭据 : 凭据.slice(0, i);
-		代理.password = i < 0 ? '' : 凭据.slice(i + 1);
-		if (p.sni) 代理.sni = p.sni;
-		if (p.alpn) 代理.alpn = 安全解码(p.alpn).split(',').filter(Boolean);
-		if (p.allowInsecure === '1') 代理['skip-cert-verify'] = true;
-		return 代理;
-	}
-
-	if (协议 === 'anytls') {
-		代理.type = 'anytls';
-		代理.password = 安全解码(u.用户信息);
-		代理.tls = true;
-		if (p.sni) 代理.sni = p.sni;
-		if (p.allowInsecure === '1') 代理['skip-cert-verify'] = true;
-		return 代理;
-	}
-
-	return null;
+	return { directPreferred, remoteUrls, directRawNodes };
 }
 
-function vmess转Clash代理(链接, 名称, 加随机UA) {
-	const 解码 = base64解码(链接.slice('vmess://'.length).split('#')[0].trim());
-	if (!解码) return null;
-	const j = JSON.parse(解码);
-	if (!j || !j.add) return null;
-	const 代理 = {
-		name: 名称, type: 'vmess',
-		server: j.add, port: Number(j.port) || 443,
-		uuid: j.id, alterId: Number(j.aid) || 0, cipher: j.scy || 'auto'
+// ---------------- URI 节点解析、改写（仅 IP/端口/名称）与双向转换 ----------------
+
+function findAuthorityEnd(rest) {
+	for (let i = 0; i < rest.length; i++) {
+		const c = rest[i];
+		if (c === '/' || c === '?' || c === '#') return i;
+	}
+	return rest.length;
+}
+
+function splitHostPort(authority) {
+	const s = String(authority || '').trim();
+	if (s.startsWith('[')) {
+		const close = s.indexOf(']');
+		const rest = close >= 0 ? s.slice(close + 1) : '';
+		return {
+			server: close >= 0 ? s.slice(1, close) : s,
+			port: rest.startsWith(':') ? (parseInt(rest.slice(1), 10) || 443) : 443
+		};
+	}
+	const colons = (s.match(/:/g) || []).length;
+	const idx = s.lastIndexOf(':');
+	if (colons === 1 && idx > 0) {
+		return { server: s.slice(0, idx), port: parseInt(s.slice(idx + 1), 10) || 443 };
+	}
+	return { server: s, port: 443 };
+}
+
+function parseQueryMap(query) {
+	const map = {};
+	for (const kv of String(query || '').split('&').filter(Boolean)) {
+		const idx = kv.indexOf('=');
+		const k = idx < 0 ? kv : kv.slice(0, idx);
+		const v = idx < 0 ? '' : kv.slice(idx + 1);
+		map[safeDecode(k)] = safeDecode(v);
+	}
+	return map;
+}
+
+function parseShareUri(rawLine) {
+	const raw = String(rawLine || '').trim();
+	const m = /^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\/(.+)$/.exec(raw);
+	if (!m) return null;
+	const proto = m[1].toLowerCase();
+	if (!SUPPORTED_URI_PROTOCOLS.has(proto)) return null;
+
+	if (proto === 'vmess') {
+		const body = m[2].split('#')[0].trim();
+		const decoded = base64Decode(body);
+		if (!decoded) return null;
+		let j;
+		try {
+			j = JSON.parse(decoded);
+		} catch {
+			return null;
+		}
+		if (!j || typeof j !== 'object' || !j.add) return null;
+		const port = parseInt(j.port, 10) || 443;
+		const isTls = j.tls === 'tls' || j.tls === true || String(j.tls || '').toLowerCase() === 'true';
+		return {
+			origin: 'uri',
+			rawUri: raw,
+			type: 'vmess',
+			name: String(j.ps || `${j.add}:${port}`),
+			server: String(j.add).trim(),
+			port,
+			credential: String(j.id || ''),
+			network: String(j.net || 'tcp').toLowerCase(),
+			isTls,
+			sni: String(j.sni || ''),
+			host: String(j.host || ''),
+			path: String(j.path || ''),
+			hasReality: false,
+			vmessJson: j
+		};
+	}
+
+	if (proto === 'ssr') {
+		const decoded = base64Decode(m[2].split('#')[0].trim());
+		if (!decoded) return null;
+		const parts = decoded.split(':');
+		if (parts.length < 6) return null;
+		let name = `${parts[0]}:${parts[1]}`;
+		const qIdx = decoded.indexOf('/?');
+		if (qIdx >= 0) {
+			const q = parseQueryMap(decoded.slice(qIdx + 2));
+			if (q.remarks) name = base64Decode(q.remarks) || name;
+		}
+		return {
+			origin: 'uri',
+			rawUri: raw,
+			type: 'ssr',
+			name,
+			server: parts[0],
+			port: parseInt(parts[1], 10) || 443,
+			credential: parts[5] || '',
+			network: 'tcp',
+			isTls: false,
+			sni: '',
+			host: '',
+			path: '',
+			hasReality: false
+		};
+	}
+
+	const rest = m[2];
+	const authEnd = findAuthorityEnd(rest);
+	let authority = rest.slice(0, authEnd);
+	let tail = rest.slice(authEnd);
+
+	let fragment = '';
+	const hashIdx = tail.indexOf('#');
+	if (hashIdx >= 0) {
+		fragment = safeDecode(tail.slice(hashIdx + 1));
+		tail = tail.slice(0, hashIdx);
+	}
+
+	let queryStr = '';
+	let urlPath = '';
+	const qIdx = tail.indexOf('?');
+	if (qIdx >= 0) {
+		urlPath = tail.slice(0, qIdx);
+		queryStr = tail.slice(qIdx + 1);
+	} else {
+		urlPath = tail;
+	}
+
+	let userinfo = '';
+	const atIdx = authority.lastIndexOf('@');
+	if (atIdx >= 0) {
+		userinfo = authority.slice(0, atIdx);
+		authority = authority.slice(atIdx + 1);
+	} else if (proto === 'ss') {
+		const dec = base64Decode(authority);
+		if (dec && dec.includes('@')) {
+			const at2 = dec.lastIndexOf('@');
+			userinfo = utf8ToBase64(dec.slice(0, at2)).replace(/=+$/, '');
+			authority = dec.slice(at2 + 1);
+		}
+	}
+
+	const hp = splitHostPort(authority);
+	const params = parseQueryMap(queryStr);
+	const security = String(params.security || '').toLowerCase();
+	const hasReality = security === 'reality' || !!params.pbk;
+	const normType = proto === 'hy2' ? 'hysteria2' : proto;
+	const isTls = normType === 'trojan' || normType === 'hysteria2' || normType === 'hysteria' ||
+		normType === 'tuic' || normType === 'anytls' || security === 'tls' || security === 'xtls' || hasReality;
+	const network = String(params.type || params.net || 'tcp').toLowerCase();
+
+	return {
+		origin: 'uri',
+		rawUri: raw,
+		type: normType,
+		rawProto: proto,
+		name: fragment || `${hp.server}:${hp.port}`,
+		server: hp.server,
+		port: hp.port,
+		credential: safeDecode(userinfo),
+		network: network === 'websocket' ? 'ws' : network,
+		isTls,
+		sni: String(params.sni || params.peer || ''),
+		host: String(params.host || ''),
+		path: String(params.path || params.serviceName || params.servicename || ''),
+		hasReality,
+		uriParts: { proto, userinfo, urlPath, queryStr, params }
 	};
-	const 传输 = String(j.net || 'tcp').toLowerCase();
-	if (传输 === 'ws') {
-		代理.network = 'ws';
-		代理['ws-opts'] = { path: j.path || '/' };
-		代理['ws-opts'].headers = {};
-		if (j.host) 代理['ws-opts'].headers.Host = j.host;
-		if (加随机UA) 代理['ws-opts'].headers['User-Agent'] = 随机UA();
-
-	} else if (传输 === 'grpc') {
-		代理.network = 'grpc';
-		代理['grpc-opts'] = { 'grpc-service-name': j.path || '' };
-	} else if (传输 === 'h2') {
-		代理.network = 'h2';
-		代理['h2-opts'] = { path: j.path || '/', host: [j.host || j.add] };
-	} else {
-		代理.network = 'tcp';
-	}
-	if (j.tls === 'tls' || j.tls === true) {
-		代理.tls = true;
-		代理.servername = j.sni || j.host || '';
-		if (j.alpn) 代理.alpn = String(j.alpn).split(',').filter(Boolean);
-	} else {
-		// 明文节点：显式写 tls: false，与实测端口族保持一致
-		代理.tls = false;
-	}
-	return 代理;
 }
 
-function 取节点名称(行) {
-	const t = String(行 || '').trim();
-	if (/^vmess:\/\//i.test(t)) {
-		const 解码 = base64解码(t.slice('vmess://'.length).split('#')[0].trim());
-		if (解码) {
-			try {
-				const j = JSON.parse(解码);
-				if (j && j.ps) return String(j.ps);
-			} catch { }
+// 仅修改 URI 的 IP / 端口 / 名称，绝不触碰 query、TLS、sni、ech 等其他参数
+function cloneUriNodeWithAddress(node, newServer, newPort, newName) {
+	const targetServer = newServer != null ? newServer : node.server;
+	const targetPort = newPort != null ? Number(newPort) : node.port;
+	const targetName = newName != null ? newName : node.name;
+
+	if (node.type === 'vmess' && node.vmessJson) {
+		const copy = Object.assign({}, node.vmessJson, {
+			add: targetServer,
+			port: String(targetPort),
+			ps: targetName
+		});
+		const rawUri = 'vmess://' + utf8ToBase64(JSON.stringify(copy));
+		return Object.assign({}, node, {
+			rawUri,
+			server: targetServer,
+			port: targetPort,
+			name: targetName,
+			vmessJson: copy
+		});
+	}
+
+	if (node.type === 'ssr') {
+		const body = node.rawUri.slice('ssr://'.length).split('#')[0].trim();
+		const dec = base64Decode(body);
+		if (!dec) return Object.assign({}, node, { name: targetName });
+		const parts = dec.split(':');
+		if (parts.length < 6) return Object.assign({}, node, { name: targetName });
+		parts[0] = targetServer;
+		parts[1] = String(targetPort);
+		let rebuilt = parts.join(':');
+		const b64Name = utf8ToBase64(targetName).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+		if (/([?&])remarks=[^&]*/.test(rebuilt)) {
+			rebuilt = rebuilt.replace(/([?&])remarks=[^&]*/, '$1remarks=' + b64Name);
+		} else {
+			rebuilt += (rebuilt.includes('/?') ? '&' : '/?') + 'remarks=' + b64Name;
 		}
-		return t;
+		const rawUri = 'ssr://' + utf8ToBase64(rebuilt).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+		return Object.assign({}, node, { rawUri, server: targetServer, port: targetPort, name: targetName });
 	}
-	const 井 = t.lastIndexOf('#');
-	return 井 >= 0 ? 安全解码(t.slice(井 + 1)) : t;
+
+	// 通用 URI：保持原前缀、userinfo、path、query 完全不变
+	const raw = node.rawUri;
+	const schemeEnd = raw.indexOf('://');
+	const prefix = raw.slice(0, schemeEnd + 3);
+	const rest = raw.slice(schemeEnd + 3);
+	const authEnd = findAuthorityEnd(rest);
+	let authority = rest.slice(0, authEnd);
+	let tail = rest.slice(authEnd);
+
+	const hashIdx = tail.indexOf('#');
+	if (hashIdx >= 0) tail = tail.slice(0, hashIdx);
+
+	let userinfoPrefix = '';
+	const atIdx = authority.lastIndexOf('@');
+	if (atIdx >= 0) {
+		userinfoPrefix = authority.slice(0, atIdx + 1);
+	} else if (node.rawProto === 'ss') {
+		const dec = base64Decode(authority);
+		if (dec && dec.includes('@')) {
+			const at2 = dec.lastIndexOf('@');
+			userinfoPrefix = utf8ToBase64(dec.slice(0, at2)).replace(/=+$/, '') + '@';
+		}
+	}
+
+	const hostPart = targetServer.includes(':') ? `[${targetServer}]` : targetServer;
+	const rawUri = `${prefix}${userinfoPrefix}${hostPart}:${targetPort}${tail}#${encodeURIComponent(targetName)}`;
+	return Object.assign({}, node, {
+		rawUri,
+		server: targetServer,
+		port: targetPort,
+		name: targetName
+	});
 }
 
-function 链接转Clash代理(链接, 名称, 加随机UA) {
-	let 节点;
-	try { 节点 = 解析节点(链接); } catch { return null; }
-	if (!节点) return null;
-	try {
-		if (节点.类型 === 'vmess') return vmess转Clash代理(节点.原始, 名称, 加随机UA);
-		if (节点.类型 === 'ssr') return null; // ssr 暂不支持导出为 Clash
-		return uri转Clash代理(节点.协议, 节点.原始, 名称, 加随机UA);
-	} catch {
-		return null;
+// ---------------- Clash YAML 无损解析与单字段改写 ----------------
+
+function unquoteYamlScalar(val) {
+	const s = String(val == null ? '' : val).trim();
+	if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+		if (s.startsWith('"')) {
+			try { return JSON.parse(s); } catch { return s.slice(1, -1); }
+		}
+		return s.slice(1, -1).replace(/''/g, "'");
 	}
+	return s;
 }
 
-// --- 极简 YAML 输出（只用于我们自建的代理对象结构） ---
-
-function yaml标量(v) {
+function yamlScalar(v) {
 	if (v === true) return 'true';
 	if (v === false) return 'false';
 	if (typeof v === 'number') return String(v);
 	const s = String(v == null ? '' : v);
 	if (s === '') return '""';
-	if (/^(true|false|null|yes|no|on|off)$/i.test(s)) return '"' + s + '"';
-	// 纯数字才需要加引号（避免被解析成数字）；含 “: ” 或首尾易歧义字符的也要加引号
-	if (/^[+-]?\d+(\.\d+)?$/.test(s)) return '"' + s + '"';
-	if (/^[A-Za-z0-9_./@+\-:\u4e00-\u9fa5]+$/.test(s) && !/:\s/.test(s) && !s.endsWith(':')) return s;
-	return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+	if (/^(true|false|null|yes|no|on|off|~)$/i.test(s)) return JSON.stringify(s);
+	if (/^[+-]?\d+(\.\d+)?$/.test(s)) return JSON.stringify(s);
+	if (/^[A-Za-z0-9_./@+\-\u4e00-\u9fa5]+$/.test(s) && !s.startsWith('-')) return s;
+	return JSON.stringify(s);
 }
 
-function yaml块(对象, 缩进) {
-	const 缩 = ' '.repeat(缩进);
-	let 输出 = '';
-	for (const [k, v] of Object.entries(对象)) {
-		if (v === undefined || v === null) continue;
-		if (Array.isArray(v)) {
-			输出 += 缩 + k + ':\n';
-			v.forEach(项 => { 输出 += 缩 + '  - ' + yaml标量(项) + '\n'; });
-		} else if (typeof v === 'object') {
-			输出 += 缩 + k + ':\n' + yaml块(v, 缩进 + 2);
+// 轻量 YAML flow 映射解析（支持嵌套 {} / [] 与带引号字符串）
+function parseFlowMap(text) {
+	let s = String(text || '').trim();
+	if (s.startsWith('-')) s = s.slice(1).trim();
+	if (!s.startsWith('{')) return null;
+
+	let i = 0;
+	const len = s.length;
+	const skipWs = () => { while (i < len && /[\s]/.test(s[i])) i++; };
+
+	const parseValue = () => {
+		skipWs();
+		if (i >= len) return '';
+		const ch = s[i];
+		if (ch === '{') return parseObj();
+		if (ch === '[') return parseArr();
+		if (ch === '"' || ch === "'") return parseQuoted(ch);
+		const start = i;
+		while (i < len && !/[,}\]]/.test(s[i])) i++;
+		const raw = s.slice(start, i).trim();
+		if (raw === 'true') return true;
+		if (raw === 'false') return false;
+		if (raw === 'null' || raw === '~') return null;
+		if (/^-?\d+(\.\d+)?$/.test(raw)) return Number(raw);
+		return raw;
+	};
+
+	const parseQuoted = (q) => {
+		i++; // skip opening quote
+		let out = '';
+		while (i < len) {
+			const c = s[i];
+			if (q === '"' && c === '\\' && i + 1 < len) {
+				out += s[i + 1];
+				i += 2;
+				continue;
+			}
+			if (q === "'" && c === "'" && s[i + 1] === "'") {
+				out += "'";
+				i += 2;
+				continue;
+			}
+			if (c === q) { i++; break; }
+			out += c;
+			i++;
+		}
+		return out;
+	};
+
+	const parseArr = () => {
+		i++; // [
+		const arr = [];
+		skipWs();
+		while (i < len && s[i] !== ']') {
+			arr.push(parseValue());
+			skipWs();
+			if (s[i] === ',') { i++; skipWs(); }
+		}
+		if (s[i] === ']') i++;
+		return arr;
+	};
+
+	const parseObj = () => {
+		i++; // {
+		const obj = {};
+		skipWs();
+		while (i < len && s[i] !== '}') {
+			let key = '';
+			if (s[i] === '"' || s[i] === "'") {
+				key = parseQuoted(s[i]);
+			} else {
+				const start = i;
+				while (i < len && s[i] !== ':' && s[i] !== '}') i++;
+				key = s.slice(start, i).trim();
+			}
+			skipWs();
+			if (s[i] === ':') i++;
+			const val = parseValue();
+			if (key) obj[key] = val;
+			skipWs();
+			if (s[i] === ',') { i++; skipWs(); }
+		}
+		if (s[i] === '}') i++;
+		return obj;
+	};
+
+	try {
+		return parseObj();
+	} catch {
+		return null;
+	}
+}
+
+// 解析块式 YAML 代理片段为 JS 对象（仅用于提取字段与 YAML→URI 转换；输出 YAML 时仍优先保留 rawLines）
+function parseBlockProxyObj(lines) {
+	if (!lines || !lines.length) return {};
+	const normalized = lines.map((line, idx) => {
+		if (idx === 0) return line.replace(/^(\s*)-\s+/, (_, sp) => sp + '  ');
+		return line;
+	});
+
+	const root = {};
+	const stack = [{ indent: -1, obj: root, keyForList: null }];
+
+	for (let li = 0; li < normalized.length; li++) {
+		const rawLine = normalized[li];
+		const trimmed = rawLine.trim();
+		if (!trimmed || trimmed.startsWith('#')) continue;
+		const indent = rawLine.match(/^(\s*)/)[1].length;
+
+		while (stack.length > 1 && indent <= stack[stack.length - 1].indent) {
+			stack.pop();
+		}
+		const parent = stack[stack.length - 1];
+
+		if (trimmed.startsWith('- ')) {
+			const valRaw = trimmed.slice(2).trim();
+			if (parent.keyForList && Array.isArray(parent.obj[parent.keyForList])) {
+				parent.obj[parent.keyForList].push(unquoteYamlScalar(valRaw));
+			}
+			continue;
+		}
+
+		const colon = trimmed.indexOf(':');
+		if (colon < 0) continue;
+		const key = unquoteYamlScalar(trimmed.slice(0, colon).trim());
+		let rest = trimmed.slice(colon + 1).trim();
+
+		// 去掉行尾未加引号的注释
+		if (rest && !rest.startsWith('"') && !rest.startsWith("'") && !rest.startsWith('{') && !rest.startsWith('[')) {
+			const commentIdx = rest.indexOf(' #');
+			if (commentIdx >= 0) rest = rest.slice(0, commentIdx).trim();
+		}
+
+		if (rest === '') {
+			// 看下一条非空行是数组还是对象
+			const nextIdx = li + 1;
+			let isArr = false;
+			for (let j = nextIdx; j < normalized.length; j++) {
+				const nt = normalized[j].trim();
+				if (!nt || nt.startsWith('#')) continue;
+				if (nt.startsWith('- ')) isArr = true;
+				break;
+			}
+			if (isArr) {
+				parent.obj[key] = [];
+				stack.push({ indent, obj: parent.obj, keyForList: key });
+			} else {
+				parent.obj[key] = {};
+				stack.push({ indent, obj: parent.obj[key], keyForList: null });
+			}
+		} else if (rest.startsWith('{') && rest.endsWith('}')) {
+			parent.obj[key] = parseFlowMap(rest) || rest;
+		} else if (rest.startsWith('[') && rest.endsWith(']')) {
+			const inner = rest.slice(1, -1).trim();
+			parent.obj[key] = inner ? inner.split(',').map(x => unquoteYamlScalar(x)) : [];
+		} else if (rest === 'true') {
+			parent.obj[key] = true;
+		} else if (rest === 'false') {
+			parent.obj[key] = false;
+		} else if (/^-?\d+(\.\d+)?$/.test(rest)) {
+			parent.obj[key] = Number(rest);
 		} else {
-			输出 += 缩 + k + ': ' + yaml标量(v) + '\n';
+			parent.obj[key] = unquoteYamlScalar(rest);
 		}
 	}
-	return 输出;
+
+	return root;
 }
 
-function 代理转YAML行(代理) {
-	const 行 = yaml块(代理, 0).replace(/\n$/, '').split('\n');
-	return 行.map((l, i) => i === 0 ? '  - ' + l : '    ' + l).join('\n');
+function buildNodeFromYamlObj(obj, rawLines, isFlow) {
+	if (!obj || typeof obj !== 'object') return null;
+	const type = String(obj.type || '').toLowerCase();
+	if (!type || !obj.server) return null;
+
+	const server = String(obj.server).trim();
+	const port = parseInt(obj.port, 10) || 443;
+	const name = String(obj.name || `${server}:${port}`);
+	const network = String(obj.network || 'tcp').toLowerCase();
+	const wsOpts = obj['ws-opts'] || {};
+	const grpcOpts = obj['grpc-opts'] || {};
+	const xhttpOpts = obj['xhttp-opts'] || {};
+	const h2Opts = obj['h2-opts'] || {};
+	const wsHeaders = wsOpts.headers || {};
+
+	const host = String(
+		wsHeaders.Host || wsHeaders.host ||
+		xhttpOpts.host ||
+		(Array.isArray(h2Opts.host) ? h2Opts.host[0] : (h2Opts.host || '')) ||
+		''
+	);
+	const path = String(
+		wsOpts.path ||
+		grpcOpts['grpc-service-name'] ||
+		xhttpOpts.path ||
+		h2Opts.path ||
+		''
+	);
+	const sni = String(obj.servername || obj.sni || '');
+	const hasReality = !!(obj['reality-opts'] && typeof obj['reality-opts'] === 'object');
+
+	let isTls;
+	if (type === 'trojan' || type === 'hysteria2' || type === 'hysteria' || type === 'tuic' || type === 'anytls') {
+		isTls = true;
+	} else if (typeof obj.tls === 'boolean') {
+		isTls = obj.tls;
+	} else if (typeof obj.tls === 'string') {
+		isTls = /^(true|yes|1)$/i.test(obj.tls.trim());
+	} else {
+		isTls = hasReality || TLS_PORTS.has(port);
+	}
+
+	const credential = String(obj.uuid || obj.password || '');
+
+	return {
+		origin: 'yaml',
+		rawLines: rawLines.slice(),
+		isFlow: !!isFlow,
+		yamlObj: obj,
+		type: type === 'hy2' ? 'hysteria2' : type,
+		name,
+		server,
+		port,
+		credential,
+		network: network === 'websocket' ? 'ws' : network,
+		isTls,
+		sni,
+		host,
+		path,
+		hasReality
+	};
 }
 
-const 默认Clash模板 = `mixed-port: 7890
+function parseClashYamlNodes(yamlText) {
+	const lines = stripBom(yamlText).replace(/\r\n/g, '\n').split('\n');
+	const nodes = [];
+	let inProxies = false;
+	let itemIndent = -1;
+	let currentLines = null;
+
+	const flushBlock = () => {
+		if (!currentLines || !currentLines.length) return;
+		// 去掉末尾空行
+		while (currentLines.length && currentLines[currentLines.length - 1].trim() === '') {
+			currentLines.pop();
+		}
+		if (!currentLines.length) return;
+		const obj = parseBlockProxyObj(currentLines);
+		const node = buildNodeFromYamlObj(obj, currentLines, false);
+		if (node) nodes.push(node);
+		currentLines = null;
+	};
+
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		const trimmed = line.trim();
+
+		if (!inProxies) {
+			if (/^proxies\s*:\s*(#.*)?$/.test(line)) {
+				inProxies = true;
+				continue;
+			}
+			continue;
+		}
+
+		// 遇到下一个顶层键（无缩进且非注释/空行）→ proxies 段结束
+		if (trimmed !== '' && !trimmed.startsWith('#') && !/^\s/.test(line) && !trimmed.startsWith('-')) {
+			flushBlock();
+			break;
+		}
+
+		if (trimmed === '' || trimmed.startsWith('#')) {
+			if (currentLines) currentLines.push(line);
+			continue;
+		}
+
+		const mFlow = /^(\s*)-\s*(\{.*\})\s*(#.*)?$/.exec(line);
+		if (mFlow && (itemIndent < 0 || mFlow[1].length <= itemIndent)) {
+			flushBlock();
+			if (itemIndent < 0) itemIndent = mFlow[1].length;
+			const obj = parseFlowMap(mFlow[2]);
+			const node = buildNodeFromYamlObj(obj, [line], true);
+			if (node) nodes.push(node);
+			continue;
+		}
+
+		const mBlock = /^(\s*)-\s+(.+)$/.exec(line);
+		if (mBlock && (itemIndent < 0 || mBlock[1].length === itemIndent)) {
+			flushBlock();
+			if (itemIndent < 0) itemIndent = mBlock[1].length;
+			currentLines = [line];
+			continue;
+		}
+
+		if (currentLines) {
+			currentLines.push(line);
+		}
+	}
+
+	flushBlock();
+	return nodes;
+}
+
+// 在 flow 风格单行 YAML 中精确替换顶层键（只替换 name / server / port，不动其他任何键）
+function replaceFlowTopLevelKey(line, key, newVal) {
+	const formatted = key === 'port' ? String(Number(newVal)) : yamlScalar(newVal);
+	const braceStart = line.indexOf('{');
+	if (braceStart < 0) return line;
+
+	let i = braceStart + 1;
+	const len = line.length;
+	let depth = 0;
+	let inQuote = null;
+
+	while (i < len) {
+		const ch = line[i];
+		if (inQuote) {
+			if (inQuote === '"' && ch === '\\') { i += 2; continue; }
+			if (ch === inQuote) inQuote = null;
+			i++;
+			continue;
+		}
+		if (ch === '"' || ch === "'") { inQuote = ch; i++; continue; }
+		if (ch === '{' || ch === '[') { depth++; i++; continue; }
+		if (ch === '}' || ch === ']') {
+			if (depth === 0) break;
+			depth--;
+			i++;
+			continue;
+		}
+
+		if (depth === 0) {
+			// 尝试在当前位置匹配 key:
+			const slice = line.slice(i);
+			const keyMatch = new RegExp(`^(\\s*)(?:["']?)${key}(?:["']?)(\\s*:\\s*)`).exec(slice);
+			if (keyMatch && (i === braceStart + 1 || /[,{\s]/.test(line[i - 1]))) {
+				const valStart = i + keyMatch[0].length;
+				let j = valStart;
+				let vDepth = 0;
+				let vQuote = null;
+				while (j < len) {
+					const c = line[j];
+					if (vQuote) {
+						if (vQuote === '"' && c === '\\') { j += 2; continue; }
+						if (c === vQuote) vQuote = null;
+						j++;
+						continue;
+					}
+					if (c === '"' || c === "'") { vQuote = c; j++; continue; }
+					if (c === '{' || c === '[') { vDepth++; j++; continue; }
+					if (c === '}' || c === ']') {
+						if (vDepth === 0) break;
+						vDepth--;
+						j++;
+						continue;
+					}
+					if (c === ',' && vDepth === 0) break;
+					j++;
+				}
+				return line.slice(0, valStart) + formatted + line.slice(j);
+			}
+		}
+		i++;
+	}
+	return line;
+}
+
+// 在块式 YAML 中精确替换顶层字段（缩进最浅的 key:）
+function replaceBlockTopLevelKey(lines, key, newVal) {
+	const formatted = key === 'port' ? String(Number(newVal)) : yamlScalar(newVal);
+	const out = lines.slice();
+	// 节点第一行形如 "  - name: xxx"，后续顶层属性缩进应为 firstIndent + 2
+	const firstIndent = (out[0].match(/^(\s*)/) || ['', ''])[1].length;
+	const propIndent = firstIndent + 2;
+
+	for (let i = 0; i < out.length; i++) {
+		const line = out[i];
+		if (i === 0) {
+			const m0 = new RegExp(`^(\\s*-\\s+${key}\\s*:\\s*)(.*)$`).exec(line);
+			if (m0) {
+				out[i] = m0[1] + formatted;
+				return out;
+			}
+		} else {
+			const m = new RegExp(`^(\\s{${propIndent}}${key}\\s*:\\s*)(.*)$`).exec(line);
+			if (m) {
+				out[i] = m[1] + formatted;
+				return out;
+			}
+		}
+	}
+	return out;
+}
+
+// 仅修改 YAML 节点的 server / port / name，绝不触碰 tls、servername、ech-opts、ws-opts 等其他字段
+function cloneYamlNodeWithAddress(node, newServer, newPort, newName) {
+	const targetServer = newServer != null ? newServer : node.server;
+	const targetPort = newPort != null ? Number(newPort) : node.port;
+	const targetName = newName != null ? newName : node.name;
+
+	let rawLines = node.rawLines.slice();
+	if (node.isFlow) {
+		let line = rawLines[0];
+		if (targetName !== node.name) line = replaceFlowTopLevelKey(line, 'name', targetName);
+		if (targetServer !== node.server) line = replaceFlowTopLevelKey(line, 'server', targetServer);
+		if (targetPort !== node.port) line = replaceFlowTopLevelKey(line, 'port', targetPort);
+		rawLines = [line];
+	} else {
+		if (targetName !== node.name) rawLines = replaceBlockTopLevelKey(rawLines, 'name', targetName);
+		if (targetServer !== node.server) rawLines = replaceBlockTopLevelKey(rawLines, 'server', targetServer);
+		if (targetPort !== node.port) rawLines = replaceBlockTopLevelKey(rawLines, 'port', targetPort);
+	}
+
+	const yamlObj = Object.assign({}, node.yamlObj, {
+		name: targetName,
+		server: targetServer,
+		port: targetPort
+	});
+
+	return Object.assign({}, node, {
+		rawLines,
+		yamlObj,
+		name: targetName,
+		server: targetServer,
+		port: targetPort
+	});
+}
+
+function cloneNodeWithAddress(node, newServer, newPort, newName) {
+	if (node.origin === 'yaml') {
+		return cloneYamlNodeWithAddress(node, newServer, newPort, newName);
+	}
+	return cloneUriNodeWithAddress(node, newServer, newPort, newName);
+}
+
+// ---------------- 双向格式转换：URI ↔ Clash ----------------
+
+function yamlBlockFromObj(obj, indent = 0) {
+	const pad = ' '.repeat(indent);
+	let out = '';
+	for (const [k, v] of Object.entries(obj)) {
+		if (v === undefined || v === null) continue;
+		if (Array.isArray(v)) {
+			if (!v.length) continue;
+			out += `${pad}${k}:\n`;
+			for (const item of v) {
+				out += `${pad}  - ${yamlScalar(item)}\n`;
+			}
+		} else if (typeof v === 'object') {
+			const nested = yamlBlockFromObj(v, indent + 2);
+			if (nested) out += `${pad}${k}:\n${nested}`;
+		} else {
+			out += `${pad}${k}: ${yamlScalar(v)}\n`;
+		}
+	}
+	return out;
+}
+
+function proxyObjToYamlLines(proxyObj) {
+	const lines = yamlBlockFromObj(proxyObj, 0).replace(/\n$/, '').split('\n');
+	return lines.map((l, i) => (i === 0 ? '  - ' + l : '    ' + l));
+}
+
+function uriNodeToClashObj(node, addRandomUA = false) {
+	if (node.origin === 'yaml') return node.yamlObj;
+	const randUA = () => RANDOM_UA_POOL[Math.floor(Math.random() * RANDOM_UA_POOL.length)];
+
+	if (node.type === 'vmess' && node.vmessJson) {
+		const j = node.vmessJson;
+		const proxy = {
+			name: node.name,
+			type: 'vmess',
+			server: node.server,
+			port: node.port,
+			uuid: j.id,
+			alterId: Number(j.aid) || 0,
+			cipher: j.scy || 'auto'
+		};
+		const net = String(j.net || 'tcp').toLowerCase();
+		if (net === 'ws' || net === 'websocket') {
+			proxy.network = 'ws';
+			proxy['ws-opts'] = { path: j.path || '/' };
+			const headers = {};
+			if (j.host) headers.Host = j.host;
+			if (addRandomUA) headers['User-Agent'] = randUA();
+			if (Object.keys(headers).length) proxy['ws-opts'].headers = headers;
+		} else if (net === 'grpc') {
+			proxy.network = 'grpc';
+			proxy['grpc-opts'] = { 'grpc-service-name': j.path || '' };
+		} else if (net === 'h2') {
+			proxy.network = 'h2';
+			proxy['h2-opts'] = { path: j.path || '/', host: [j.host || node.server] };
+		} else if (net === 'xhttp' || net === 'splithttp') {
+			proxy.network = 'xhttp';
+			proxy['xhttp-opts'] = { path: j.path || '/' };
+			if (j.host) proxy['xhttp-opts'].host = j.host;
+		} else {
+			proxy.network = 'tcp';
+		}
+		if (node.isTls) {
+			proxy.tls = true;
+			if (j.sni || j.host) proxy.servername = j.sni || j.host;
+			if (j.alpn) proxy.alpn = String(j.alpn).split(',').map(s => s.trim()).filter(Boolean);
+			if (j.fp) proxy['client-fingerprint'] = j.fp;
+		} else {
+			proxy.tls = false;
+		}
+		return proxy;
+	}
+
+	if (!node.uriParts) return null;
+	const p = node.uriParts.params || {};
+	const security = String(p.security || '').toLowerCase();
+	const type = node.type;
+	const proxy = { name: node.name, server: node.server, port: node.port };
+
+	const applyTransport = () => {
+		const net = node.network || 'tcp';
+		if (net === 'ws') {
+			proxy.network = 'ws';
+			proxy['ws-opts'] = { path: p.path || '/' };
+			const headers = {};
+			if (p.host) headers.Host = p.host;
+			if (addRandomUA) headers['User-Agent'] = randUA();
+			if (Object.keys(headers).length) proxy['ws-opts'].headers = headers;
+		} else if (net === 'grpc') {
+			proxy.network = 'grpc';
+			proxy['grpc-opts'] = { 'grpc-service-name': p.serviceName || p.servicename || p.path || '' };
+		} else if (net === 'h2' || net === 'http') {
+			proxy.network = 'h2';
+			proxy['h2-opts'] = { path: p.path || '/', host: [p.host || node.server] };
+		} else if (net === 'xhttp' || net === 'splithttp') {
+			proxy.network = 'xhttp';
+			proxy['xhttp-opts'] = { path: p.path || '/' };
+			if (p.host) proxy['xhttp-opts'].host = p.host;
+			if (p.mode) proxy['xhttp-opts'].mode = p.mode;
+		} else {
+			proxy.network = 'tcp';
+		}
+	};
+
+	if (type === 'vless' || type === 'trojan') {
+		proxy.type = type;
+		if (type === 'vless') proxy.uuid = node.credential;
+		else proxy.password = node.credential;
+		applyTransport();
+		if (security === 'reality' || p.pbk) {
+			proxy.tls = true;
+			proxy['reality-opts'] = { 'public-key': p.pbk || '' };
+			if (p.sid) proxy['reality-opts']['short-id'] = p.sid;
+			if (p.sni) proxy.servername = p.sni;
+			if (p.fp) proxy['client-fingerprint'] = p.fp;
+		} else if (type === 'trojan' || security === 'tls') {
+			proxy.tls = true;
+			const sni = p.sni || p.peer || p.host;
+			if (sni) proxy.servername = sni;
+			if (p.alpn) proxy.alpn = p.alpn.split(',').map(s => s.trim()).filter(Boolean);
+			if (p.fp) proxy['client-fingerprint'] = p.fp;
+			if (p.allowInsecure === '1' || p.allowInsecure === 'true' || p.insecure === '1') {
+				proxy['skip-cert-verify'] = true;
+			}
+		} else {
+			proxy.tls = false;
+		}
+		if (type === 'vless' && p.flow) proxy.flow = p.flow;
+		return proxy;
+	}
+
+	if (type === 'ss') {
+		const cred = base64Decode(node.uriParts.userinfo) || node.credential;
+		const colon = cred.indexOf(':');
+		proxy.type = 'ss';
+		proxy.cipher = colon < 0 ? cred : cred.slice(0, colon);
+		proxy.password = colon < 0 ? '' : cred.slice(colon + 1);
+		if (p.plugin) proxy.plugin = p.plugin;
+		return proxy;
+	}
+
+	if (type === 'hysteria2') {
+		proxy.type = 'hysteria2';
+		proxy.password = node.credential;
+		if (p.sni) proxy.sni = p.sni;
+		if (p.insecure === '1' || p.allowInsecure === '1') proxy['skip-cert-verify'] = true;
+		if (p.obfs) proxy.obfs = p.obfs;
+		if (p['obfs-password']) proxy['obfs-password'] = p['obfs-password'];
+		if (p.mport || p.ports) proxy.ports = p.mport || p.ports;
+		return proxy;
+	}
+
+	if (type === 'tuic') {
+		const colon = node.credential.indexOf(':');
+		proxy.type = 'tuic';
+		proxy.uuid = colon < 0 ? node.credential : node.credential.slice(0, colon);
+		proxy.password = colon < 0 ? '' : node.credential.slice(colon + 1);
+		if (p.sni) proxy.sni = p.sni;
+		if (p.alpn) proxy.alpn = p.alpn.split(',').map(s => s.trim()).filter(Boolean);
+		if (p.congestion_control) proxy['congestion-controller'] = p.congestion_control;
+		if (p.udp_relay_mode) proxy['udp-relay-mode'] = p.udp_relay_mode;
+		if (p.allow_insecure === '1' || p.allowInsecure === '1') proxy['skip-cert-verify'] = true;
+		return proxy;
+	}
+
+	if (type === 'anytls') {
+		proxy.type = 'anytls';
+		proxy.password = node.credential;
+		if (p.sni) proxy.sni = p.sni;
+		if (p.alpn) proxy.alpn = p.alpn.split(',').map(s => s.trim()).filter(Boolean);
+		if (p.fp) proxy['client-fingerprint'] = p.fp;
+		if (p.insecure === '1' || p.allowInsecure === '1') proxy['skip-cert-verify'] = true;
+		return proxy;
+	}
+
+	return null;
+}
+
+// Clash YAML 节点 → 标准分享 URI（覆盖 vless / vmess / trojan / ss / hysteria2 / tuic / anytls）
+function clashNodeToShareUri(node) {
+	if (node.origin === 'uri') return node.rawUri;
+	const o = node.yamlObj || {};
+	const type = String(node.type || o.type || '').toLowerCase();
+	const server = String(node.server || o.server || '');
+	const port = Number(node.port || o.port || 443);
+	const hostPart = server.includes(':') ? `[${server}]` : server;
+	const name = String(node.name || o.name || `${server}:${port}`);
+	const frag = '#' + encodeURIComponent(name);
+
+	const buildQuery = (pairs) => {
+		const list = pairs.filter(([, v]) => v !== undefined && v !== null && v !== '');
+		return list.length ? '?' + list.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&') : '';
+	};
+
+	if (type === 'vmess') {
+		const wsOpts = o['ws-opts'] || {};
+		const grpcOpts = o['grpc-opts'] || {};
+		const h2Opts = o['h2-opts'] || {};
+		const xhttpOpts = o['xhttp-opts'] || {};
+		const wsHeaders = wsOpts.headers || {};
+		const net = String(o.network || 'tcp').toLowerCase();
+		const host = wsHeaders.Host || wsHeaders.host || xhttpOpts.host || (Array.isArray(h2Opts.host) ? h2Opts.host[0] : h2Opts.host) || '';
+		const path = wsOpts.path || grpcOpts['grpc-service-name'] || xhttpOpts.path || h2Opts.path || '';
+		const payload = {
+			v: '2',
+			ps: name,
+			add: server,
+			port: String(port),
+			id: String(o.uuid || ''),
+			aid: String(o.alterId || 0),
+			scy: String(o.cipher || 'auto'),
+			net,
+			type: 'none',
+			host: String(host),
+			path: String(path),
+			tls: node.isTls ? 'tls' : ''
+		};
+		if (o.servername || o.sni) payload.sni = String(o.servername || o.sni);
+		if (Array.isArray(o.alpn) && o.alpn.length) payload.alpn = o.alpn.join(',');
+		if (o['client-fingerprint']) payload.fp = String(o['client-fingerprint']);
+		return 'vmess://' + utf8ToBase64(JSON.stringify(payload));
+	}
+
+	if (type === 'vless' || type === 'trojan') {
+		const cred = encodeURIComponent(String(type === 'vless' ? (o.uuid || '') : (o.password || '')));
+		const net = String(o.network || 'tcp').toLowerCase();
+		const wsOpts = o['ws-opts'] || {};
+		const grpcOpts = o['grpc-opts'] || {};
+		const xhttpOpts = o['xhttp-opts'] || {};
+		const h2Opts = o['h2-opts'] || {};
+		const wsHeaders = wsOpts.headers || {};
+		const reality = o['reality-opts'] || null;
+
+		const q = [];
+		if (type === 'vless') q.push(['encryption', o.encryption || 'none']);
+		if (o.flow) q.push(['flow', o.flow]);
+
+		if (reality && typeof reality === 'object') {
+			q.push(['security', 'reality']);
+			if (reality['public-key']) q.push(['pbk', reality['public-key']]);
+			if (reality['short-id']) q.push(['sid', reality['short-id']]);
+		} else if (node.isTls) {
+			q.push(['security', 'tls']);
+		} else {
+			q.push(['security', 'none']);
+		}
+
+		if (o.servername || o.sni) q.push(['sni', o.servername || o.sni]);
+		if (o['client-fingerprint']) q.push(['fp', o['client-fingerprint']]);
+		if (Array.isArray(o.alpn) && o.alpn.length) q.push(['alpn', o.alpn.join(',')]);
+		if (o['skip-cert-verify'] === true) q.push(['allowInsecure', '1']);
+
+		q.push(['type', net]);
+		if (net === 'ws') {
+			if (wsOpts.path) q.push(['path', wsOpts.path]);
+			if (wsHeaders.Host || wsHeaders.host) q.push(['host', wsHeaders.Host || wsHeaders.host]);
+		} else if (net === 'grpc') {
+			if (grpcOpts['grpc-service-name']) q.push(['serviceName', grpcOpts['grpc-service-name']]);
+		} else if (net === 'xhttp' || net === 'splithttp') {
+			if (xhttpOpts.path) q.push(['path', xhttpOpts.path]);
+			if (xhttpOpts.host) q.push(['host', xhttpOpts.host]);
+			if (xhttpOpts.mode) q.push(['mode', xhttpOpts.mode]);
+		} else if (net === 'h2') {
+			if (h2Opts.path) q.push(['path', h2Opts.path]);
+			const h = Array.isArray(h2Opts.host) ? h2Opts.host[0] : h2Opts.host;
+			if (h) q.push(['host', h]);
+		}
+
+		return `${type}://${cred}@${hostPart}:${port}${buildQuery(q)}${frag}`;
+	}
+
+	if (type === 'ss') {
+		const userinfo = utf8ToBase64(`${o.cipher || 'aes-256-gcm'}:${o.password || ''}`).replace(/=+$/, '');
+		const q = [];
+		if (o.plugin) q.push(['plugin', o.plugin]);
+		return `ss://${userinfo}@${hostPart}:${port}${buildQuery(q)}${frag}`;
+	}
+
+	if (type === 'hysteria2' || type === 'hy2') {
+		const q = [];
+		if (o.sni || o.servername) q.push(['sni', o.sni || o.servername]);
+		if (o['skip-cert-verify'] === true) q.push(['insecure', '1']);
+		if (o.obfs) q.push(['obfs', o.obfs]);
+		if (o['obfs-password']) q.push(['obfs-password', o['obfs-password']]);
+		if (o.ports) q.push(['mport', o.ports]);
+		return `hysteria2://${encodeURIComponent(String(o.password || ''))}@${hostPart}:${port}${buildQuery(q)}${frag}`;
+	}
+
+	if (type === 'tuic') {
+		const q = [];
+		if (o.sni || o.servername) q.push(['sni', o.sni || o.servername]);
+		if (Array.isArray(o.alpn) && o.alpn.length) q.push(['alpn', o.alpn.join(',')]);
+		if (o['congestion-controller']) q.push(['congestion_control', o['congestion-controller']]);
+		if (o['udp-relay-mode']) q.push(['udp_relay_mode', o['udp-relay-mode']]);
+		if (o['skip-cert-verify'] === true) q.push(['allow_insecure', '1']);
+		const cred = `${encodeURIComponent(String(o.uuid || ''))}:${encodeURIComponent(String(o.password || ''))}`;
+		return `tuic://${cred}@${hostPart}:${port}${buildQuery(q)}${frag}`;
+	}
+
+	if (type === 'anytls') {
+		const q = [];
+		if (o.sni || o.servername) q.push(['sni', o.sni || o.servername]);
+		if (Array.isArray(o.alpn) && o.alpn.length) q.push(['alpn', o.alpn.join(',')]);
+		if (o['client-fingerprint']) q.push(['fp', o['client-fingerprint']]);
+		if (o['skip-cert-verify'] === true) q.push(['insecure', '1']);
+		return `anytls://${encodeURIComponent(String(o.password || ''))}@${hostPart}:${port}${buildQuery(q)}${frag}`;
+	}
+
+	return null;
+}
+
+// ---------------- 订阅内容识别与归一 ----------------
+
+function looksLikeUriList(text) {
+	const lines = stripBom(text).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+	if (!lines.length) return false;
+	const hit = lines.filter(l => {
+		const m = /^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\//.exec(l);
+		return m && SUPPORTED_URI_PROTOCOLS.has(m[1].toLowerCase());
+	}).length;
+	return hit > 0 && hit >= Math.min(lines.length, 1);
+}
+
+function parseSubscriptionContent(rawText) {
+	const text = stripBom(rawText).trim();
+	if (!text) return { format: 'empty', nodes: [], rawYaml: '' };
+
+	// 1. Clash YAML
+	if (/^proxies\s*:/m.test(text)) {
+		const nodes = parseClashYamlNodes(text);
+		if (nodes.length > 0) {
+			return { format: 'yaml', nodes, rawYaml: text };
+		}
+	}
+
+	// 2. 明文 URI 列表
+	if (looksLikeUriList(text)) {
+		const nodes = text.split(/\r?\n/).map(parseShareUri).filter(Boolean);
+		if (nodes.length > 0) return { format: 'plain', nodes, rawYaml: '' };
+	}
+
+	// 3. Base64 URI 列表
+	const decoded = base64Decode(text);
+	if (decoded && looksLikeUriList(decoded)) {
+		const nodes = decoded.split(/\r?\n/).map(parseShareUri).filter(Boolean);
+		if (nodes.length > 0) return { format: 'base64', nodes, rawYaml: '' };
+	}
+
+	return { format: 'unknown', nodes: [], rawYaml: '' };
+}
+
+// ---------------- Clash 配置组装 ----------------
+
+const DEFAULT_CLASH_TEMPLATE = `mixed-port: 7890
 allow-lan: false
 mode: rule
 log-level: info
 external-controller: 127.0.0.1:9090
 dns:
   enable: true
-  ipv6: false
+  ipv6: true
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   nameserver:
@@ -994,679 +1718,1626 @@ dns:
     - 119.29.29.29
 proxies:
 proxy-groups:
-  - name: 选择
+  - name: 🚀 节点选择
     type: select
     proxies:
-      - 自动
-      - DIRECT
-  - name: 自动
+      - ⚡ 自动选择
+__CF_GROUP_REF__      - DIRECT
+__ALL_PROXIES__
+  - name: ⚡ 自动选择
     type: url-test
     url: http://www.gstatic.com/generate_204
     interval: 300
+    tolerance: 50
     proxies:
-__PROXIES_NAMES__
-rules:
+__ALL_PROXIES__
+__CF_GROUP_BLOCK__rules:
+  - GEOIP,LAN,DIRECT
   - GEOIP,CN,DIRECT
-  - MATCH,选择
+  - MATCH,🚀 节点选择
 `;
 
-// 把模板里的顶层 `键:` 段整体换成新内容；模板没有该段则追加（只认行首无缩进的顶层键）
-function 替换Clash段(文本, 键, 新段) {
-	const 行数组 = 文本.split('\n');
-	let 起 = -1, 止 = 行数组.length;
-	for (let i = 0; i < 行数组.length; i++) {
-		if (new RegExp('^' + 键 + '\\s*:').test(行数组[i])) { 起 = i; break; }
+function replaceTopYamlSection(text, key, newSection) {
+	const lines = stripBom(text).replace(/\r\n/g, '\n').split('\n');
+	const keyRe = new RegExp(`^${key}\\s*:`);
+	let start = -1;
+	let end = lines.length;
+	for (let i = 0; i < lines.length; i++) {
+		if (keyRe.test(lines[i])) { start = i; break; }
 	}
-	if (起 < 0) return 文本.replace(/\s*$/, '\n') + 新段 + '\n';
-	for (let i = 起 + 1; i < 行数组.length; i++) {
-		if (行数组[i].trim() === '' || 行数组[i].trim().startsWith('#')) continue;
-		if (!/^\s/.test(行数组[i])) { 止 = i; break; }
+	if (start < 0) return text.replace(/\s*$/, '\n') + newSection + '\n';
+	for (let i = start + 1; i < lines.length; i++) {
+		const t = lines[i].trim();
+		if (t === '' || t.startsWith('#')) continue;
+		if (!/^\s/.test(lines[i])) { end = i; break; }
 	}
-	return 行数组.slice(0, 起).concat(新段.split('\n'), 行数组.slice(止)).join('\n');
+	return [...lines.slice(0, start), ...newSection.split('\n'), ...lines.slice(end)].join('\n');
 }
 
-function 生成Clash配置(代理列表, 模板文本, 跳过说明) {
-	const 代理YAML = 代理列表.map(代理转YAML行).join('\n');
-	const 名称列表 = 代理列表.map(a => '      - ' + yaml标量(a.name)).join('\n');
-	const 段 = (跳过说明.length ? '# 以下节点未能转换为 Clash：' + 跳过说明.join(' / ') + '\n' : '') + 'proxies:\n' + 代理YAML;
+function buildClashOutput(finalNodes, options) {
+	const {
+		headerComments = [],
+		templateText = '',
+		addRandomUA = false
+	} = options || {};
 
-	let 文本 = 模板文本 && 模板文本.trim() ? 模板文本 : 默认Clash模板;
-	文本 = 替换Clash段(文本, 'proxies', 段);
-	文本 = 文本.replaceAll('__PROXIES_NAMES__', 名称列表);
-	return 文本;
-}
+	const proxyYamlBlocks = [];
+	const allNames = [];
+	const cfNames = [];
+	const skipped = [];
 
-async function 改写订阅(配置, 用户代理, 原始UA) {
-	const 拉取UA = 解析拉取UA(配置.pullua, 原始UA);
-	const 源地址 = 配置.url;
-	const 内联链接 = 配置.link || '';
-
-	if (!源地址 && !内联链接) {
-		return new Response('缺少源订阅：请提供 url 参数或 link 节点内容', { status: 400, headers: 订阅头() });
-	}
-
-	let 源文本 = '';
-	try {
-		if (内联链接) 源文本 = 内联链接;
-		if (源地址) {
-			源文本 = await 拉取远程(源地址, 拉取UA, 10000);
-		}
-	} catch (错误) {
-		return new Response('源订阅拉取失败：' + 错误.message, { status: 502, headers: 订阅头() });
-	}
-
-	if (!源文本 || !源文本.trim()) {
-		return new Response('源订阅内容为空', { status: 502, headers: 订阅头() });
-	}
-
-	// 实测列表
-	let 实测文本 = 配置.add || '';
-	if (!实测文本 && 配置.addapi) {
-		try {
-			实测文本 = await 拉取远程(配置.addapi, 拉取UA, 10000);
-		} catch (错误) {
-			return new Response('实测优选列表拉取失败：' + 错误.message, { status: 502, headers: 订阅头() });
+	for (const node of finalNodes) {
+		if (node.origin === 'yaml') {
+			proxyYamlBlocks.push(node.rawLines.join('\n'));
+			allNames.push(node.name);
+			if (node._isAppendedCF) cfNames.push(node.name);
+		} else {
+			const obj = uriNodeToClashObj(node, addRandomUA);
+			if (obj) {
+				proxyYamlBlocks.push(proxyObjToYamlLines(obj).join('\n'));
+				allNames.push(obj.name);
+				if (node._isAppendedCF) cfNames.push(obj.name);
+			} else {
+				skipped.push(node.name);
+			}
 		}
 	}
 
-	let 条目列表 = 切分列表(实测文本).map(解析实测条目).filter(Boolean);
+	const topCommentLines = headerComments.map(c => `# ${c}`);
+	if (skipped.length) {
+		topCommentLines.push(`# 以下节点暂不支持导出为 Clash：${skipped.slice(0, 10).join(' / ')}`);
+	}
+	const commentHeader = topCommentLines.length ? topCommentLines.join('\n') + '\n' : '';
+	const proxiesSection = 'proxies:\n' + proxyYamlBlocks.join('\n');
+	const allNamesYaml = allNames.map(n => `      - ${yamlScalar(n)}`).join('\n');
 
-	const 数量 = parseInt(配置.num, 10);
-	if (数量 > 0) 条目列表 = 条目列表.slice(0, 数量);
+	if (templateText && templateText.trim()) {
+		let out = replaceTopYamlSection(templateText, 'proxies', proxiesSection);
+		out = out.replaceAll('__PROXIES_NAMES__', allNamesYaml).replaceAll('__ALL_PROXIES__', allNamesYaml);
+		return commentHeader + out;
+	}
 
-	const 规范化 = 规范化源(源文本);
+	const cfGroupRef = cfNames.length ? '      - ☁️ CF优选\n' : '';
+	const cfGroupBlock = cfNames.length
+		? `  - name: ☁️ CF优选\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    tolerance: 50\n    proxies:\n${cfNames.map(n => `      - ${yamlScalar(n)}`).join('\n')}\n`
+		: '';
 
-	if (!条目列表.length) {
-		// 没有实测列表时原样返回，至少不给客户端坏订阅
-		return new Response(规范化.格式 === 'base64' ? 源文本.trim() : 规范化.文本, {
-			headers: 订阅头({ 'content-type': 规范化.格式 === 'yaml' ? 'text/yaml; charset=utf-8' : 'text/plain; charset=utf-8' })
+	let out = DEFAULT_CLASH_TEMPLATE;
+	out = replaceTopYamlSection(out, 'proxies', proxiesSection);
+	out = out
+		.replaceAll('__CF_GROUP_REF__', cfGroupRef)
+		.replaceAll('__CF_GROUP_BLOCK__', cfGroupBlock)
+		.replaceAll('__ALL_PROXIES__', allNamesYaml);
+
+	return commentHeader + out;
+}
+
+// ---------------- 核心流水线：多源聚合 + CF 识别 + 去重基准 + 严对口 Append ----------------
+
+function landingFingerprint(node) {
+	return [
+		String(node.type || '').toLowerCase(),
+		String(node.credential || ''),
+		String(node.network || 'tcp').toLowerCase(),
+		node.isTls ? 'tls' : 'notls',
+		String(node.sni || '').trim().toLowerCase(),
+		String(node.host || '').trim().toLowerCase(),
+		String(node.path || '').trim()
+	].join('|');
+}
+
+function deduplicateNodeNames(nodes) {
+	const counts = new Map();
+	return nodes.map(node => {
+		const base = String(node.name || `${node.server}:${node.port}`).trim() || 'node';
+		const prev = counts.get(base) || 0;
+		counts.set(base, prev + 1);
+		if (prev === 0) return node;
+		let seq = prev + 1;
+		let candidate = `${base}-${seq}`;
+		while (counts.has(candidate)) {
+			seq++;
+			candidate = `${base}-${seq}`;
+		}
+		counts.set(candidate, 1);
+		const renamed = cloneNodeWithAddress(node, node.server, node.port, candidate);
+		if (node._isAppendedCF) renamed._isAppendedCF = true;
+		if (node._isAggregatedExtra) renamed._isAggregatedExtra = true;
+		return renamed;
+	});
+}
+
+async function runSpeedSubPipeline(config, clientUA, rawClientUA, deps = {}) {
+	const fetcher = deps.fetchRemote || fetchRemote;
+	const dohResolver = deps.dohQueryCF || dohQueryCF;
+
+	const pullUA = resolvePullUA(config.pullua || 'clash', rawClientUA || clientUA);
+	const requestedFormat = String(config.format || 'clash').trim().toLowerCase();
+	const { urls: sourceUrls, rawNodes: inlineSourceNodes } = extractSources(config.url || '', config.link || '');
+	const allInOne = parseAllInOneRaw(config.add || '', config.addapi || '');
+
+	if (!sourceUrls.length && !inlineSourceNodes.length && !allInOne.remoteUrls.length && !allInOne.directRawNodes.length) {
+		return {
+			ok: false,
+			status: 400,
+			error: '缺少源订阅：请至少填写一个源订阅链接或代理节点'
+		};
+	}
+
+	// 1. 并发拉取所有源订阅（单源失败跳过）
+	const sourceFetches = await Promise.allSettled(
+		sourceUrls.map(u => fetcher(u, pullUA, 10000).then(text => ({ url: u, text })))
+	);
+
+	let sourcesOk = 0;
+	const sourcesTotal = sourceUrls.length + (inlineSourceNodes.length ? 1 : 0);
+	const sourceErrors = [];
+	const inputNodes = [];
+	const detectedSourceFormats = [];
+
+	for (let i = 0; i < sourceFetches.length; i++) {
+		const r = sourceFetches[i];
+		if (r.status === 'fulfilled') {
+			const parsed = parseSubscriptionContent(r.value.text);
+			if (parsed.nodes.length > 0) {
+				sourcesOk++;
+				detectedSourceFormats.push(parsed.format);
+				inputNodes.push(...parsed.nodes);
+			} else {
+				sourceErrors.push({ url: sourceUrls[i], error: '未解析到有效节点' });
+			}
+		} else {
+			sourceErrors.push({ url: sourceUrls[i], error: r.reason ? String(r.reason.message || r.reason) : '拉取失败' });
+		}
+	}
+
+	if (inlineSourceNodes.length) {
+		const parsedInline = inlineSourceNodes.map(parseShareUri).filter(Boolean);
+		if (parsedInline.length) {
+			sourcesOk++;
+			detectedSourceFormats.push('plain');
+			inputNodes.push(...parsedInline);
+		}
+	}
+
+	// 2. 并发拉取多合一输入框内的远程地址（优选 IP API / sub:// / 汇聚订阅）
+	const preferredEntries = allInOne.directPreferred.slice();
+	const extraAggregateNodes = allInOne.directRawNodes.map(parseShareUri).filter(Boolean).map(n => {
+		n._isAggregatedExtra = true;
+		return n;
+	});
+
+	if (allInOne.remoteUrls.length) {
+		const extraFetches = await Promise.allSettled(
+			allInOne.remoteUrls.map(u => fetcher(u, pullUA, 10000).then(text => ({ url: u, text })))
+		);
+		for (let i = 0; i < extraFetches.length; i++) {
+			const r = extraFetches[i];
+			if (r.status !== 'fulfilled') {
+				sourceErrors.push({ url: allInOne.remoteUrls[i], error: '优选/汇聚地址拉取失败：' + (r.reason ? (r.reason.message || r.reason) : '未知错误') });
+				continue;
+			}
+			const text = r.value.text;
+			// 先判断是否是订阅（Clash YAML / Base64 / 明文节点列表）
+			const asSub = parseSubscriptionContent(text);
+			if (asSub.nodes.length > 0) {
+				for (const n of asSub.nodes) {
+					n._isAggregatedExtra = true;
+					extraAggregateNodes.push(n);
+				}
+				continue;
+			}
+			// 否则按优选 IP / 域名条目解析
+			for (const line of stripBom(text).split(/\r?\n/)) {
+				const entry = parsePreferredEntry(line);
+				if (entry) preferredEntries.push(entry);
+			}
+		}
+	}
+
+	// 兼容旧版 ?num=N 参数
+	const limitNum = parseInt(config.num, 10);
+	const effectivePreferred = limitNum > 0 ? preferredEntries.slice(0, limitNum) : preferredEntries;
+	const { tlsPool, noTlsPool } = classifyPreferredPools(effectivePreferred);
+
+	if (!inputNodes.length && !extraAggregateNodes.length) {
+		const errDetail = sourceErrors.length ? '（' + sourceErrors.map(e => `${e.url}: ${e.error}`).join('; ') + '）' : '';
+		return {
+			ok: false,
+			status: 502,
+			error: '未获取到任何可用节点' + errDetail,
+			sourceErrors
+		};
+	}
+
+	const warnings = [];
+	const hasPreferredPool = tlsPool.length > 0 || noTlsPool.length > 0;
+	const mode = hasPreferredPool ? 'cf-optimize' : 'pure-aggregate';
+
+	let keptOriginalNodes = [];
+	let appendedCfNodes = [];
+	let cfTlsLandings = 0;
+	let cfNoTlsLandings = 0;
+	let cfTlsNodeCount = 0;
+	let cfNoTlsNodeCount = 0;
+
+	if (mode === 'pure-aggregate') {
+		// 纯汇总转换模式：不精简、不改写、不弹缺类型警告
+		keptOriginalNodes = inputNodes.slice();
+	} else {
+		// CF 优选模式：三层精准识别 CF 节点
+		const cfFlags = await detectCFNodes(inputNodes, dohResolver);
+		const seenLandingKeys = new Set();
+		const tlsBaselines = [];
+		const noTlsBaselines = [];
+
+		for (let i = 0; i < inputNodes.length; i++) {
+			const node = inputNodes[i];
+			const flag = cfFlags[i];
+			if (!flag.isCF) {
+				// 非 CF 节点全部原样保留
+				keptOriginalNodes.push(node);
+				continue;
+			}
+			if (node.isTls) cfTlsNodeCount++;
+			else cfNoTlsNodeCount++;
+
+			const fp = landingFingerprint(node);
+			if (!seenLandingKeys.has(fp)) {
+				// 每个独立 CF 落地只保留 1 条基准原节点
+				seenLandingKeys.add(fp);
+				keptOriginalNodes.push(node);
+				if (node.isTls) {
+					cfTlsLandings++;
+					tlsBaselines.push(node);
+				} else {
+					cfNoTlsLandings++;
+					noTlsBaselines.push(node);
+				}
+			}
+		}
+
+		// 严格对口配对 TLS 池与非 TLS 池，绝不跨类型错配，绝不修改 TLS 开关
+		if (tlsBaselines.length > 0 && tlsPool.length > 0) {
+			const count = Math.max(tlsPool.length, tlsBaselines.length);
+			for (let i = 0; i < count; i++) {
+				const tpl = tlsBaselines[i % tlsBaselines.length];
+				const entry = tlsPool[i % tlsPool.length];
+				const tag = entry.name || `${entry.host}:${entry.port}`;
+				const newName = `[CF优选] ${tpl.name} · ${tag}`;
+				const cloned = cloneNodeWithAddress(tpl, entry.host, entry.port, newName);
+				cloned._isAppendedCF = true;
+				appendedCfNodes.push(cloned);
+			}
+		} else if (tlsBaselines.length > 0 && tlsPool.length === 0) {
+			warnings.push(`检测到 ${tlsBaselines.length} 个 TLS CF 落地（原 ${cfTlsNodeCount} 条节点），但未提供 TLS 优选 IP（443/2053/2083/2087/2096/8443），已原样保留 TLS 原节点`);
+		}
+
+		if (noTlsBaselines.length > 0 && noTlsPool.length > 0) {
+			const count = Math.max(noTlsPool.length, noTlsBaselines.length);
+			for (let i = 0; i < count; i++) {
+				const tpl = noTlsBaselines[i % noTlsBaselines.length];
+				const entry = noTlsPool[i % noTlsPool.length];
+				const tag = entry.name || `${entry.host}:${entry.port}`;
+				const newName = `[CF优选] ${tpl.name} · ${tag}`;
+				const cloned = cloneNodeWithAddress(tpl, entry.host, entry.port, newName);
+				cloned._isAppendedCF = true;
+				appendedCfNodes.push(cloned);
+			}
+		} else if (noTlsBaselines.length > 0 && noTlsPool.length === 0) {
+			warnings.push(`检测到 ${noTlsBaselines.length} 个非 TLS CF 落地（原 ${cfNoTlsNodeCount} 条节点），但未提供非 TLS 优选 IP（80/8080/8880/2052/2082/2086/2095），已原样保留非 TLS 原节点`);
+		}
+	}
+
+	const combinedNodes = [...keptOriginalNodes, ...appendedCfNodes, ...extraAggregateNodes];
+	const finalNodes = deduplicateNodeNames(combinedNodes);
+
+	// 决定输出格式
+	let outputFormat = requestedFormat;
+	if (!['clash', 'base64', 'plain', 'auto'].includes(outputFormat)) outputFormat = 'clash';
+	if (outputFormat === 'auto') {
+		const ua = String(clientUA || '').toLowerCase();
+		if (ua.includes('clash') || ua.includes('mihomo') || ua.includes('stash') || ua.includes('meta')) {
+			outputFormat = 'clash';
+		} else if (detectedSourceFormats.length && detectedSourceFormats.every(f => f === 'yaml')) {
+			outputFormat = 'clash';
+		} else if (detectedSourceFormats.length && detectedSourceFormats.every(f => f === 'plain')) {
+			outputFormat = 'plain';
+		} else {
+			outputFormat = 'base64';
+		}
+	}
+
+	const sourcesSummary = `${sourcesOk}/${sourcesTotal}`;
+	const headerComments = [
+		`SpeedSub | 模式: ${mode === 'cf-optimize' ? 'CF优选' : '纯汇总'} | 源成功: ${sourcesSummary} | 输出节点: ${finalNodes.length}`
+	];
+	if (mode === 'cf-optimize') {
+		headerComments.push(`SpeedSub | 独立CF落地: ${cfTlsLandings + cfNoTlsLandings} (TLS:${cfTlsLandings} / 非TLS:${cfNoTlsLandings}) | 保留原节点: ${keptOriginalNodes.length} | Append优选: ${appendedCfNodes.length} | 汇聚节点: ${extraAggregateNodes.length}`);
+	}
+	for (const w of warnings) headerComments.push(`SpeedSub Warning: ${w}`);
+
+	let resultText = '';
+	let contentType = 'text/plain; charset=utf-8';
+
+	if (outputFormat === 'clash') {
+		resultText = buildClashOutput(finalNodes, {
+			headerComments,
+			templateText: config.template || '',
+			addRandomUA: config.ua === '1'
+		});
+		contentType = 'text/yaml; charset=utf-8';
+	} else {
+		const uris = finalNodes.map(clashNodeToShareUri).filter(Boolean);
+		if (!uris.length) {
+			return {
+				ok: false,
+				status: 400,
+				error: '当前节点暂不支持导出为分享链接格式'
+			};
+		}
+		const plainText = uris.join('\n');
+		resultText = outputFormat === 'base64' ? utf8ToBase64(plainText) : plainText;
+		contentType = 'text/plain; charset=utf-8';
+	}
+
+	const missingTypes = {
+		missingTls: mode === 'cf-optimize' && cfTlsLandings > 0 && tlsPool.length === 0,
+		missingNoTls: mode === 'cf-optimize' && cfNoTlsLandings > 0 && noTlsPool.length === 0,
+		cfTlsLandings,
+		cfNoTlsLandings,
+		cfTlsNodeCount,
+		cfNoTlsNodeCount
+	};
+
+	return {
+		ok: true,
+		status: 200,
+		mode,
+		format: outputFormat,
+		contentType,
+		sourcesSummary,
+		warnings,
+		missingTypes,
+		stats: {
+			sourcesTotal,
+			sourcesOk,
+			sourceErrors,
+			totalInputNodes: inputNodes.length,
+			cfLandings: cfTlsLandings + cfNoTlsLandings,
+			cfTlsLandings,
+			cfNoTlsLandings,
+			keptOriginalNodes: keptOriginalNodes.length,
+			appendedCfNodes: appendedCfNodes.length,
+			aggregatedExtraNodes: extraAggregateNodes.length,
+			outputTotalNodes: finalNodes.length,
+			preferredTlsCount: tlsPool.length,
+			preferredNoTlsCount: noTlsPool.length
+		},
+		result: resultText
+	};
+}
+
+function makeSubscriptionResponse(pipelineResult, requestUrl) {
+	if (!pipelineResult.ok) {
+		return new Response(pipelineResult.error || '转换失败', {
+			status: pipelineResult.status || 500,
+			headers: subHeaders()
 		});
 	}
-
-	if (规范化.格式 === 'yaml') {
-		const 改写后 = 改写Clash配置(规范化.文本, 条目列表, 配置.tls !== '0');
-		if (改写后) {
-			return new Response(改写后, { headers: 订阅头({ 'content-type': 'text/yaml; charset=utf-8' }) });
-		}
-		// YAML 里没找到可改写的 proxies，退回节点列表处理
+	const extra = {
+		'content-type': pipelineResult.contentType,
+		'X-SpeedSub-Sources': pipelineResult.sourcesSummary,
+		'X-SpeedSub-Mode': pipelineResult.mode
+	};
+	if (pipelineResult.warnings.length) {
+		extra['X-SpeedSub-Warning'] = encodeURIComponent(pipelineResult.warnings.join(' | '));
 	}
-
-	const 改写后 = 改写节点列表(规范化.文本, 条目列表, 配置.tls !== '0');
-	if (!改写后) {
-		return new Response('源订阅中没有可改写的节点（已识别的协议：' + 支持协议.join(' / ') + ' / vmess / ssr）', { status: 400, headers: 订阅头() });
+	if (pipelineResult.format === 'clash') {
+		extra['Content-Disposition'] = 'inline; filename="speedsub-clash.yaml"';
 	}
-
-	let 输出 = 改写后;
-	const 格式 = (配置.format || 'clash').toLowerCase();
-	const 浏览器 = /mozilla|chrome|safari|firefox|edge/i.test(用户代理 || '');
-
-	if (格式 === 'clash') {
-		const 行数组 = 改写后.split('\n').filter(l => /^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//.test(l.trim()));
-		const 代理列表 = [];
-		const 跳过 = [];
-		for (const 行 of 行数组) {
-			const 名称 = 取节点名称(行);
-			const 代理 = 链接转Clash代理(行, 名称, 配置.ua === '1');
-			if (代理) 代理列表.push(代理);
-			else 跳过.push(名称);
-		}
-		if (!代理列表.length) {
-			return new Response('无法把任何节点转换为 Clash 配置（ssr 等协议暂不支持导出）', { status: 400, headers: 订阅头() });
-		}
-		const 配置文本 = 生成Clash配置(代理列表, 配置.template || '', 跳过);
-		return new Response(配置文本, {
-			headers: 订阅头({
-				'content-type': 'text/yaml; charset=utf-8',
-				'Content-Disposition': "attachment; filename*=utf-8''config.yaml"
-			})
-		});
-	}
-
-	if (格式 === 'base64' || (格式 !== 'plain' && !浏览器 && 规范化.格式 === 'base64')) {
-		输出 = btoa(unescape(encodeURIComponent(改写后)));
-	}
-
-	return new Response(输出, { headers: 订阅头() });
+	return new Response(pipelineResult.result, { status: 200, headers: subHeaders(extra) });
 }
 
-// ---------------- KV 配置档 ----------------
+// ---------------- KV 配置档 API ----------------
 
-async function 读配置索引(KV) {
+async function readProfileIndex(KV) {
 	try {
-		return JSON.parse((await KV.get(配置索引键)) || '[]');
+		const raw = await KV.get(PROFILE_INDEX_KEY);
+		const arr = JSON.parse(raw || '[]');
+		return Array.isArray(arr) ? arr : [];
 	} catch {
 		return [];
 	}
 }
 
-function json响应(数据, 状态) {
-	return new Response(JSON.stringify(数据, null, 2), {
-		status: 状态 || 200,
-		headers: { 'content-type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
-	});
+function buildShortUrl(request, id, k) {
+	const u = new URL(request.url);
+	return `${u.origin}/s/${id}?k=${k}`;
 }
 
-async function 处理配置档接口(request, url, env) {
-	const KV = env ? env[KV绑定名] : null;
-	if (!KV) return json响应({ error: '未绑定 KV，当前为手动模式' }, 501);
+async function handleProfileApi(request, url, env) {
+	if (!(await isAdminAuthed(request, env))) {
+		return jsonResponse({ error: '需要管理口令授权', needAuth: true }, 401);
+	}
+	const KV = env ? env[KV_BINDING] : null;
+	if (!KV) return jsonResponse({ error: '未绑定 KV，当前为手动模式', kvUnavailable: true }, 501);
 
-	const 动作 = url.searchParams.get('action') || '';
+	const action = url.searchParams.get('action') || '';
 	const id = url.searchParams.get('id') || '';
 
-	if (request.method === 'GET' && (动作 === 'list' || !id)) {
-		const 索引 = await 读配置索引(KV);
-		const 列表 = [];
-		for (const 档id of 索引) {
-			const 配置 = await KV.get(配置键前缀 + 档id, 'json');
-			if (配置) 列表.push({ id: 档id, label: 配置.label || 档id });
+	if (request.method === 'GET' && (action === 'list' || !id)) {
+		const index = await readProfileIndex(KV);
+		const list = [];
+		for (const pid of index) {
+			const prof = await KV.get(PROFILE_PREFIX + pid, 'json');
+			if (prof) {
+				list.push({
+					id: pid,
+					label: prof.label || pid,
+					format: prof.format || 'clash',
+					pullua: prof.pullua || 'clash',
+					updated: prof.updated || '',
+					k: prof.k || '',
+					shortUrl: buildShortUrl(request, pid, prof.k || '')
+				});
+			}
 		}
-		return json响应({ list: 列表 });
+		return jsonResponse({ list });
 	}
 
 	if (request.method === 'GET') {
-		const 配置 = await KV.get(配置键前缀 + id, 'json');
-		if (!配置) return json响应({ error: '配置档不存在' }, 404);
-		delete 配置.k;
-		return json响应(配置);
+		const prof = await KV.get(PROFILE_PREFIX + id, 'json');
+		if (!prof) return jsonResponse({ error: '配置档不存在' }, 404);
+		return jsonResponse(Object.assign({}, prof, {
+			id,
+			shortUrl: buildShortUrl(request, id, prof.k || '')
+		}));
 	}
 
 	if (request.method === 'POST') {
-		let 提交;
+		let body;
 		try {
-			提交 = await request.json();
+			body = await request.json();
 		} catch {
-			return json响应({ error: '请求体不是合法 JSON' }, 400);
+			return jsonResponse({ error: '请求体不是合法 JSON' }, 400);
 		}
-		if (!提交.url && !提交.link && !提交.add && !提交.addapi) {
-			return json响应({ error: '请至少填写源订阅或实测列表' }, 400);
+		if (!body.url && !body.link && !body.add && !body.addapi) {
+			return jsonResponse({ error: '请至少填写源订阅地址或汇聚节点' }, 400);
 		}
 
-		let 目标id = id || 提交.id || '';
-		let 密钥 = 提交.k || url.searchParams.get('k') || '';
-		const 索引 = await 读配置索引(KV);
+		let targetId = id || body.id || '';
+		let key = body.k || url.searchParams.get('k') || '';
+		const index = await readProfileIndex(KV);
 
-		if (目标id) {
-			const 已有 = await KV.get(配置键前缀 + 目标id, 'json');
-			if (已有) {
-				if (已有.k && 已有.k !== 密钥) return json响应({ error: '密钥不正确' }, 403);
-				密钥 = 密钥 || 已有.k;
-			} else if (!密钥) {
-				密钥 = 随机密钥();
+		if (targetId) {
+			const existing = await KV.get(PROFILE_PREFIX + targetId, 'json');
+			if (existing) {
+				if (existing.k && key && existing.k !== key) {
+					return jsonResponse({ error: '配置档密钥不匹配' }, 403);
+				}
+				key = existing.k || key || randomKey();
+			} else if (!key) {
+				key = randomKey();
 			}
 		} else {
-			目标id = 随机ID();
-			密钥 = 密钥 || 随机密钥();
+			targetId = randomId();
+			key = key || randomKey();
 		}
 
-		const 记录 = {
-			url: 提交.url || '',
-			link: 提交.link || '',
-			add: 提交.add || '',
-			addapi: 提交.addapi || '',
-			num: 提交.num || '',
-			format: 提交.format || 'clash',
-			template: 提交.template || '',
-			tls: 提交.tls || '1',
-			ua: 提交.ua || '0',
-			pullua: 提交.pullua || 'auto',
-			label: 提交.label || 目标id,
-			k: 密钥,
+		const record = {
+			url: String(body.url || ''),
+			link: String(body.link || ''),
+			add: String(body.add || ''),
+			addapi: String(body.addapi || ''),
+			num: String(body.num || ''),
+			format: String(body.format || 'clash'),
+			template: String(body.template || ''),
+			ua: String(body.ua || '0'),
+			pullua: String(body.pullua || 'clash'),
+			label: String(body.label || '').trim() || ('配置-' + targetId.slice(0, 4)),
+			k: key,
 			updated: new Date().toISOString()
 		};
 
-		await KV.put(配置键前缀 + 目标id, JSON.stringify(记录));
-		if (!索引.includes(目标id)) {
-			索引.push(目标id);
-			await KV.put(配置索引键, JSON.stringify(索引));
+		await KV.put(PROFILE_PREFIX + targetId, JSON.stringify(record));
+		if (!index.includes(targetId)) {
+			index.unshift(targetId);
+			await KV.put(PROFILE_INDEX_KEY, JSON.stringify(index));
 		}
 
-		return json响应({
-			ok: true, id: 目标id, k: 密钥,
-			url: 'https://' + request.headers.get('host') + '/s/' + 目标id + '?k=' + 密钥
+		const shortUrl = buildShortUrl(request, targetId, key);
+		return jsonResponse({
+			ok: true,
+			id: targetId,
+			k: key,
+			label: record.label,
+			url: shortUrl,
+			shortUrl
 		});
 	}
 
 	if (request.method === 'DELETE') {
-		const 已有 = await KV.get(配置键前缀 + id, 'json');
-		if (!已有) return json响应({ error: '配置档不存在' }, 404);
+		const existing = await KV.get(PROFILE_PREFIX + id, 'json');
+		if (!existing) return jsonResponse({ error: '配置档不存在' }, 404);
 		const k = url.searchParams.get('k') || '';
-		if (已有.k && 已有.k !== k) return json响应({ error: '密钥不正确' }, 403);
-		await KV.delete(配置键前缀 + id);
-		const 索引 = (await 读配置索引(KV)).filter(x => x !== id);
-		await KV.put(配置索引键, JSON.stringify(索引));
-		return json响应({ ok: true });
+		if (existing.k && k && existing.k !== k) {
+			return jsonResponse({ error: '配置档密钥不匹配' }, 403);
+		}
+		await KV.delete(PROFILE_PREFIX + id);
+		const index = (await readProfileIndex(KV)).filter(x => x !== id);
+		await KV.put(PROFILE_INDEX_KEY, JSON.stringify(index));
+		return jsonResponse({ ok: true });
 	}
 
-	return json响应({ error: '不支持的方法' }, 405);
+	return jsonResponse({ error: '不支持的方法' }, 405);
 }
 
-async function 处理配置档订阅(request, url, 路径, 用户代理, env) {
-	const KV = env ? env[KV绑定名] : null;
-	if (!KV) return new Response('未绑定 KV：无法读取配置档', { status: 501, headers: 订阅头() });
+async function handleProfileSub(request, url, pathname, clientUA, env) {
+	const KV = env ? env[KV_BINDING] : null;
+	if (!KV) return new Response('未绑定 KV：无法读取配置档', { status: 501, headers: subHeaders() });
 
-	const id = 路径.replace(/^\/s\//, '').replace(/\/+$/, '');
-	const 配置 = await KV.get(配置键前缀 + id, 'json');
-	if (!配置) return new Response('配置档不存在', { status: 404, headers: 订阅头() });
+	const id = pathname.replace(/^\/s\//, '').replace(/\/+$/, '');
+	const prof = await KV.get(PROFILE_PREFIX + id, 'json');
+	if (!prof) return new Response('配置档不存在', { status: 404, headers: subHeaders() });
 
 	const k = url.searchParams.get('k') || '';
-	if (配置.k && 配置.k !== k) return new Response('密钥不正确', { status: 403, headers: 订阅头() });
+	if (prof.k && prof.k !== k) return new Response('密钥不正确', { status: 403, headers: subHeaders() });
 
-	return 改写订阅(Object.assign({}, 配置, { tls: url.searchParams.get('tls') || 配置.tls || '1', ua: url.searchParams.get('ua') || 配置.ua || '0', pullua: url.searchParams.get('pullua') || 配置.pullua || 'auto' }), 用户代理, request.headers.get('User-Agent') || '');
+	const merged = Object.assign({}, prof, {
+		format: url.searchParams.get('format') || prof.format || 'clash',
+		pullua: url.searchParams.get('pullua') || prof.pullua || 'clash',
+		num: url.searchParams.get('num') || prof.num || '',
+		template: url.searchParams.get('template') || prof.template || '',
+		ua: url.searchParams.get('ua') || prof.ua || '0'
+	});
+
+	const res = await runSpeedSubPipeline(merged, clientUA, request.headers.get('User-Agent') || '');
+	return makeSubscriptionResponse(res, url);
 }
 
-// ---------------- 页面 ----------------
+async function handlePreviewApi(request, url, clientUA, env) {
+	if (!(await isAdminAuthed(request, env))) {
+		return jsonResponse({ error: '需要管理口令授权', needAuth: true }, 401);
+	}
+	if (request.method !== 'POST') {
+		return jsonResponse({ error: '请使用 POST 请求' }, 405);
+	}
+	let body;
+	try {
+		body = await request.json();
+	} catch {
+		return jsonResponse({ error: '请求体不是合法 JSON' }, 400);
+	}
 
-function 页面(KV可用) {
-	return new Response(HTML模板.replace('__KV_AVAILABLE__', KV可用 ? 'true' : 'false'), {
-		headers: { 'content-type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' }
+	let cfg = body || {};
+	if (cfg.profileId && !cfg.url && !cfg.add) {
+		const KV = env ? env[KV_BINDING] : null;
+		if (KV) {
+			const prof = await KV.get(PROFILE_PREFIX + cfg.profileId, 'json');
+			if (prof) cfg = Object.assign({}, prof, cfg);
+		}
+	}
+
+	const result = await runSpeedSubPipeline({
+		url: cfg.url || '',
+		link: cfg.link || '',
+		add: cfg.add || '',
+		addapi: cfg.addapi || '',
+		format: cfg.format || 'clash',
+		pullua: cfg.pullua || 'clash',
+		num: cfg.num || '',
+		template: cfg.template || '',
+		ua: cfg.ua || '0'
+	}, clientUA, request.headers.get('User-Agent') || '');
+
+	return jsonResponse(result, result.ok ? 200 : (result.status || 400));
+}
+
+async function handleAuthApi(request, url, env) {
+	const pass = getAdminPass(env);
+	if (!pass) return jsonResponse({ ok: true, adminProtected: false });
+
+	if (request.method !== 'POST') return jsonResponse({ error: 'Method Not Allowed' }, 405);
+	let body;
+	try {
+		body = await request.json();
+	} catch {
+		return jsonResponse({ error: '无效 JSON' }, 400);
+	}
+	const submitted = String((body && body.pass) || '').trim();
+	if (!timingSafeEqualStr(submitted, pass)) {
+		return jsonResponse({ ok: false, error: '管理口令不正确' }, 401);
+	}
+	const token = await signAdminToken(pass);
+	const isHttps = url.protocol === 'https:';
+	const cookie = `${ADMIN_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${isHttps ? '; Secure' : ''}`;
+	return jsonResponse({ ok: true, adminProtected: true }, 200, { 'Set-Cookie': cookie });
+}
+
+function handleLogoutApi(url) {
+	const isHttps = url.protocol === 'https:';
+	const cookie = `${ADMIN_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${isHttps ? '; Secure' : ''}`;
+	return jsonResponse({ ok: true }, 200, { 'Set-Cookie': cookie });
+}
+
+// ---------------- Web UI 页面 ----------------
+
+async function renderPage(request, env) {
+	const kvAvailable = !!(env && env[KV_BINDING]);
+	const adminProtected = !!getAdminPass(env);
+	const authed = await isAdminAuthed(request, env);
+	const boot = JSON.stringify({ kvAvailable, adminProtected, authed });
+	return new Response(HTML_TEMPLATE.replace('__SPEEDSUB_BOOT__', boot), {
+		headers: {
+			'content-type': 'text/html; charset=UTF-8',
+			'Cache-Control': 'no-store'
+		}
 	});
 }
 
-const HTML模板 = `<!DOCTYPE html>
+const HTML_TEMPLATE = String.raw`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>实测优选订阅改写器</title>
-	<style>
-		:root { --primary-color:#4361ee; --hover-color:#3b4fd3; --bg-color:#f5f6fa; }
-		* { box-sizing:border-box; margin:0; padding:0; }
-		body {
-			background:#f5f6fa;
-			font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-			line-height:1.6; color:#333; min-height:100vh;
-			display:flex; justify-content:center; align-items:flex-start; padding:32px 16px;
-		}
-		.container {
-			max-width:640px; width:100%; background:#fff;
-			padding:2rem; border-radius:16px; box-shadow:0 10px 20px rgba(0,0,0,.06);
-		}
-		h1 { text-align:center; color:var(--primary-color); margin-bottom:.5rem; font-size:1.6rem; }
-		.desc { text-align:center; color:#666; font-size:.9rem; margin-bottom:1.5rem; }
-		.input-group { margin-bottom:1.2rem; }
-		label { display:block; margin-bottom:.4rem; color:#555; font-weight:600; font-size:.9rem; }
-		.hint { font-size:.8rem; color:#888; margin-top:.3rem; }
-		input, select, textarea {
-			width:100%; padding:10px 12px; border:2px solid rgba(0,0,0,.12);
-			border-radius:10px; font-size:1rem; font-family:inherit;
-			transition:all .2s ease;
-		}
-		textarea { resize:vertical; min-height:5em; line-height:1.5; }
-		#add { min-height:9em; }
-		input:focus, select:focus, textarea:focus {
-			outline:none; border-color:var(--primary-color);
-			box-shadow:0 0 0 3px rgba(67,97,238,.15);
-		}
-		.row { display:flex; gap:12px; }
-		.row > * { flex:1; }
-		button {
-			width:100%; padding:12px; background:var(--primary-color); color:#fff;
-			border:none; border-radius:10px; font-size:1rem; font-weight:600;
-			cursor:pointer; transition:all .2s ease;
-		}
-		button:hover { background:var(--hover-color); }
-		button + button { margin-top:8px; }
-		button.ghost { background:#fff; color:var(--primary-color); border:2px solid var(--primary-color); }
-		button.ghost:hover { background:#f0f2ff; }
-		button.mini { padding:8px; font-size:.85rem; }
-		#result { background:#f8f9fa; font-family:monospace; word-break:break-all; }
-		#qrcode { display:flex; justify-content:center; margin-top:14px; }
-		.section { border-top:1px solid #eee; margin-top:1.6rem; padding-top:1.2rem; }
-		.section h2 { font-size:1rem; color:#444; margin-bottom:.8rem; }
-		.status { font-size:.85rem; margin-top:.6rem; min-height:1.2em; }
-		.ok { color:#1a7f37; } .err { color:#c92a2a; }
-		.badge { display:inline-block; font-size:.75rem; padding:2px 8px; border-radius:10px; background:#eee; color:#666; }
-		.badge.on { background:#e6f4ea; color:#1a7f37; }
-		.badge.off { background:#fff4e5; color:#b06000; }
-	</style>
-	<script src="https://cdn.jsdelivr.net/npm/@keeex/qrcodejs-kx@1.0.2/qrcode.min.js"></script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#4f46e5">
+<title>SpeedSub · CF 优选订阅聚合器</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Cpath d='M18 5 9 18h6l-1 9 9-13h-6l1-9z' fill='white'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#f5f6fb; --bg2:#eef0fa; --card:#ffffff; --card2:#f7f8fd; --fg:#141826;
+  --muted:#5f6785; --faint:#8b93ad; --border:#e3e6f0; --border2:#d3d8e8;
+  --primary:#4f46e5; --primary-2:#6d5ef6; --primary-fg:#ffffff;
+  --ok:#0f9d63; --warn:#b26a00; --err:#d13438; --info:#2563eb;
+  --shadow:0 1px 2px rgba(20,24,38,.04),0 12px 32px -18px rgba(20,24,38,.28);
+  --radius:16px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0d1017; --bg2:#0a0c12; --card:#161a24; --card2:#1b2030; --fg:#eef1f8;
+    --muted:#a2abc2; --faint:#7b849c; --border:#262c3b; --border2:#333a4d;
+    --primary:#7c74ff; --primary-2:#948cff; --primary-fg:#0d1017;
+    --ok:#3ddc97; --warn:#f5b455; --err:#ff6b6b; --info:#6ba8ff;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 16px 40px -20px rgba(0,0,0,.7);
+  }
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;padding:0}
+body{
+  font-family:var(--sans); color:var(--fg); line-height:1.55;
+  background:radial-gradient(1200px 600px at 15% -10%,rgba(124,116,255,.18),transparent 60%),
+             radial-gradient(1000px 500px at 110% 0%,rgba(56,189,248,.12),transparent 55%),
+             var(--bg);
+  min-height:100vh; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:900px;margin:0 auto;padding:28px 18px 72px}
+header{display:flex;align-items:center;gap:14px;margin-bottom:22px;flex-wrap:wrap}
+.logo{width:44px;height:44px;border-radius:13px;background:linear-gradient(135deg,var(--primary),var(--primary-2));display:grid;place-items:center;box-shadow:0 8px 20px -8px rgba(79,70,229,.7);flex:0 0 auto}
+.logo svg{width:24px;height:24px;fill:#fff}
+@media (prefers-color-scheme: dark){.logo svg{fill:#0d1017}}
+h1{font-size:1.28rem;margin:0;letter-spacing:.2px}
+.sub{font-size:.82rem;color:var(--muted);margin:2px 0 0}
+.head-right{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
+.pad{padding:20px}
+.stack{display:flex;flex-direction:column;gap:16px}
+h2{font-size:.95rem;margin:0 0 2px}
+.hint{font-size:.78rem;color:var(--faint);margin:0}
+label.field{display:block}
+.field-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px;flex-wrap:wrap}
+.field-head .lbl{font-size:.88rem;font-weight:600}
+.opt{font-size:.74rem;color:var(--faint);font-weight:400;margin-left:6px}
+textarea,input[type=text],input[type=password],select{
+  width:100%;font-family:var(--sans);font-size:.9rem;color:var(--fg);
+  background:var(--card2);border:1px solid var(--border2);border-radius:12px;
+  padding:11px 13px;outline:none;transition:border-color .15s,box-shadow .15s;
+}
+textarea{resize:vertical;min-height:96px;font-family:var(--mono);font-size:.84rem;line-height:1.65}
+textarea:focus,input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(124,116,255,.18)}
+select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 18px) 52%,calc(100% - 13px) 52%;background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:38px;cursor:pointer}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:620px){.two{grid-template-columns:1fr}}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid var(--border2);background:var(--card);color:var(--fg);border-radius:11px;padding:9px 14px;font-size:.86rem;font-weight:600;cursor:pointer;transition:transform .06s,background .15s,border-color .15s;white-space:nowrap}
+.btn:hover{border-color:var(--primary)}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:linear-gradient(135deg,var(--primary),var(--primary-2));border:none;color:var(--primary-fg);padding:12px 18px;font-size:.95rem;box-shadow:0 10px 24px -12px rgba(79,70,229,.85)}
+.btn.primary:hover{filter:brightness(1.06)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--primary);padding:6px 9px;font-size:.8rem}
+.btn.ghost:hover{background:rgba(124,116,255,.1);border-color:transparent}
+.btn.sm{padding:6px 10px;font-size:.78rem;border-radius:9px}
+.btn.danger{color:var(--err);border-color:rgba(209,52,56,.35)}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
+.link-card{padding:14px;position:sticky;top:10px;z-index:20;background:linear-gradient(180deg,var(--card),var(--card2));backdrop-filter:blur(8px)}
+.link-card .ttl{font-size:.76rem;font-weight:700;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;display:flex;align-items:center;gap:7px}
+.link-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.link-row input{font-family:var(--mono);font-size:.82rem;flex:1 1 260px;min-width:0}
+#shortLink{filter:blur(4.5px);transition:filter .18s}
+#shortLink.show{filter:none}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:.7rem;font-weight:700;padding:3px 8px;border-radius:999px;letter-spacing:.02em}
+.badge.ok{background:rgba(15,157,99,.12);color:var(--ok)}
+.badge.warn{background:rgba(178,106,0,.14);color:var(--warn)}
+.badge.info{background:rgba(37,99,235,.12);color:var(--info)}
+.badge.muted{background:rgba(139,147,173,.16);color:var(--muted)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}
+.gate{position:fixed;inset:0;background:rgba(8,10,16,.6);backdrop-filter:blur(6px);display:grid;place-items:center;padding:18px;z-index:100}
+.gate .box{width:100%;max-width:380px;background:var(--card);border:1px solid var(--border);border-radius:20px;padding:26px;box-shadow:0 30px 80px -30px rgba(0,0,0,.6)}
+.gate h2{font-size:1.1rem;margin:0 0 4px}
+.gate p{font-size:.82rem;color:var(--muted);margin:0 0 16px}
+.err-text{color:var(--err);font-size:.8rem;min-height:1.2em;margin-top:8px}
+dialog{border:1px solid var(--border);border-radius:18px;background:var(--card);color:var(--fg);padding:0;max-width:min(760px,calc(100vw - 28px));width:100%;box-shadow:0 40px 100px -40px rgba(0,0,0,.6)}
+dialog::backdrop{background:rgba(8,10,16,.55);backdrop-filter:blur(4px)}
+.dlg-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 20px 12px;border-bottom:1px solid var(--border)}
+.dlg-head h3{font-size:1rem;margin:0}
+.dlg-body{padding:18px 20px;max-height:min(66vh,640px);overflow:auto}
+.dlg-foot{padding:14px 20px 18px;border-top:1px solid var(--border);display:flex;gap:9px;justify-content:flex-end;flex-wrap:wrap}
+.x{border:none;background:transparent;color:var(--muted);font-size:1.35rem;line-height:1;cursor:pointer;padding:2px 6px;border-radius:8px}
+.x:hover{background:var(--card2);color:var(--fg)}
+pre{background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:13px;overflow:auto;font-family:var(--mono);font-size:.78rem;line-height:1.55;max-height:44vh;white-space:pre;margin:0}
+.doc{font-size:.86rem;line-height:1.7}
+.doc h4{margin:16px 0 6px;font-size:.88rem}
+.doc p,.doc li{color:var(--muted)}
+.doc ul{padding-left:20px;margin:6px 0}
+.doc code{font-family:var(--mono);background:var(--card2);border:1px solid var(--border);border-radius:6px;padding:1px 5px;font-size:.8rem;color:var(--fg)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:14px}
+.stat{background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:10px 12px}
+.stat .k{font-size:.72rem;color:var(--faint)}
+.stat .v{font-size:1.2rem;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums}
+.stat .v small{font-size:.72rem;font-weight:500;color:var(--muted)}
+.callout{border-radius:12px;padding:11px 13px;font-size:.82rem;margin-bottom:12px;border:1px solid transparent}
+.callout.warn{background:rgba(178,106,0,.1);border-color:rgba(178,106,0,.25);color:var(--warn)}
+.callout.err{background:rgba(209,52,56,.09);border-color:rgba(209,52,56,.25);color:var(--err)}
+.callout.info{background:rgba(37,99,235,.08);border-color:rgba(37,99,235,.22);color:var(--info)}
+.callout ul{margin:6px 0 0;padding-left:20px}
+.profile-item{display:flex;gap:12px;align-items:flex-start;padding:12px 0;border-top:1px solid var(--border)}
+.profile-item:first-child{border-top:none}
+.profile-item .pi-main{flex:1;min-width:0}
+.profile-item .pi-name{font-weight:600;font-size:.88rem;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.profile-item .pi-meta{font-size:.74rem;color:var(--faint);margin-top:2px;word-break:break-all}
+.profile-item .pi-actions{display:flex;gap:6px;flex-wrap:wrap}
+.toast-wrap{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);display:flex;flex-direction:column;gap:8px;z-index:120;pointer-events:none;width:max-content;max-width:calc(100vw - 32px)}
+.toast{pointer-events:auto;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--primary);border-radius:11px;padding:10px 15px;font-size:.83rem;box-shadow:0 18px 40px -18px rgba(0,0,0,.5);animation:slideup .22s ease}
+.toast.ok{border-left-color:var(--ok)}
+.toast.error{border-left-color:var(--err)}
+.toast.warn{border-left-color:var(--warn)}
+@keyframes slideup{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+#qrBox{display:grid;place-items:center;padding:8px;background:#fff;border-radius:14px;width:262px;height:262px;margin:0 auto}
+#qrBox canvas,#qrBox img{max-width:100%;height:auto}
+.spin{width:15px;height:15px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+.foot{text-align:center;font-size:.74rem;color:var(--faint);margin-top:26px;line-height:1.9}
+.foot a{color:var(--muted);text-decoration:none}
+.foot a:hover{color:var(--primary)}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:.76rem;background:var(--card2);border:1px solid var(--border);border-radius:999px;padding:3px 10px;color:var(--muted)}
+.chip button{border:none;background:transparent;color:var(--err);cursor:pointer;font-size:.8rem;padding:0 2px}
+.seg-hint{display:flex;align-items:center;gap:8px;margin-top:6px;font-size:.75rem;color:var(--faint);flex-wrap:wrap}
+</style>
 </head>
 <body>
-	<div class="container">
-		<h1>实测优选订阅改写器</h1>
-		<p class="desc">源订阅连接信息原样保留，仅按位置替换「地址:端口」<br>
-		<span id="kvBadge" class="badge"></span></p>
+<div class="wrap">
+  <header>
+    <div class="logo"><svg viewBox="0 0 24 24"><path d="M13 2 4.5 14.5H10L9 22l8.5-12.5H12L13 2z"/></svg></div>
+    <div>
+      <h1>SpeedSub</h1>
+      <p class="sub">多订阅汇总转换 · Cloudflare 优选 IP 加速</p>
+    </div>
+    <div class="head-right">
+      <span class="badge muted" id="kvBadge" hidden></span>
+      <span class="badge ok" id="adminBadge" hidden>已登录</span>
+      <button class="btn sm" id="logoutBtn" type="button" hidden>退出</button>
+    </div>
+  </header>
 
-		<div class="input-group">
-			<label for="url">源订阅地址</label>
-			<textarea id="url" placeholder="https://example.com/sub?host=...&#10;（也可直接在这里粘贴节点链接，每行一个）"></textarea>
-		</div>
+  <div class="stack">
 
-		<div class="input-group">
-			<label for="pullua">拉取源订阅的客户端类型（User-Agent）</label>
-			<select id="pullua" onchange="切换拉取UA()">
-				<option value="auto">自动跟随客户端（默认）</option>
-				<option value="clash">Clash（拉取 Clash YAML）</option>
-				<option value="v2rayng">v2rayNG（拉取 base64 节点）</option>
-				<option value="v2rayn">v2rayN</option>
-				<option value="surge">Surge</option>
-				<option value="shadowrocket">Shadowrocket</option>
-				<option value="custom">自定义…</option>
-			</select>
-			<input type="text" id="pulluaCustom" placeholder="输入完整 User-Agent 字符串" style="display:none;margin-top:6px">
-			<div class="hint">自适应订阅按拉取 UA 返回不同内容：要拿 Clash YAML 就选 Clash（输出格式建议同时选「Clash 配置」）。</div>
-		</div>
+    <!-- 短链卡 -->
+    <section class="card link-card" id="linkCard" hidden>
+      <div class="ttl">
+        <span class="dot" style="color:var(--ok)"></span>
+        订阅链接
+        <span class="badge muted" id="linkModeBadge">KV 短链</span>
+      </div>
+      <div class="link-row">
+        <input type="text" id="shortLink" readonly spellcheck="false">
+        <button class="btn sm" type="button" id="revealBtn" title="显示 / 隐藏">显示</button>
+        <button class="btn sm" type="button" id="copyBtn">复制</button>
+        <button class="btn sm" type="button" id="previewBtn">预览</button>
+        <button class="btn sm" type="button" id="qrBtn">二维码</button>
+        <button class="btn sm" type="button" id="openLinkBtn">打开</button>
+      </div>
+      <p class="hint" id="linkHint" style="margin-top:8px"></p>
+    </section>
 
-		<div class="input-group">
-			<label for="listSrc">实测优选列表来源</label>
-			<select id="listSrc">
-				<option value="text">粘贴文本</option>
-				<option value="url">远程 URL（ADDAPI）</option>
-			</select>
-		</div>
+    <!-- 主表单 -->
+    <section class="card pad">
+      <form id="form" class="stack" autocomplete="off">
+        <div>
+          <div class="field-head">
+            <span class="lbl">① 源订阅<span class="opt">每行一条，可混写订阅链接与裸节点</span></span>
+          </div>
+          <textarea id="url" rows="5" placeholder="https://example.com/api/v1/client/subscribe?token=xxx&#10;vless://uuid@1.2.3.4:443?security=tls&sni=a.com#节点&#10;（中文说明、符号、空行会被自动忽略；重复项自动去重）"></textarea>
+          <div class="seg-hint">支持 http(s) 链接、base64 订阅、Clash YAML、明文分享链接</div>
+        </div>
 
-		<div class="input-group" id="addBox">
-			<label for="add">实测优选列表</label>
-			<textarea id="add" placeholder="每行一个：&#10;1.2.3.4:443&#10;5.6.7.8:2053#香港-01&#10;[2001:db8::1]:443#日本"></textarea>
-			<div class="hint">支持 <code>ip:端口</code>、<code>ip:端口#名称</code>、<code>[IPv6]:端口</code>；逗号或换行分隔。带 #名称 的按原样作节点名，未带的默认用「ip:端口」作名。</div>
-		</div>
+        <div>
+          <div class="field-head">
+            <span class="lbl">② 自定义优选与汇聚<span class="opt">可留空</span></span>
+            <button class="btn ghost" type="button" id="openHelp">📍 填写说明</button>
+          </div>
+          <textarea id="add" rows="7" placeholder="104.16.0.1&#10;104.16.0.2:2053&#10;2606:4700::1&#10;cf.090227.xyz&#10;https://api.example.com/cfip-list&#10;sub://你的订阅域名/path&#10;# 备注写在行尾，例如 104.16.0.1:443 #香港"></textarea>
+          <div class="seg-hint">
+            <span class="chip" id="modeChip">未填 = 纯汇总模式</span>
+            <span>留空时只做多源汇总 + 格式转换 + 全局去重，不改写任何节点。</span>
+          </div>
+        </div>
 
-		<div class="input-group" id="addapiBox" style="display:none">
-			<label for="addapi">实测优选列表 URL</label>
-			<input type="text" id="addapi" placeholder="https://你的列表地址/list.txt">
-			<div class="hint">内容格式同上；更新列表内容后，客户端刷新订阅即自动生效。</div>
-		</div>
+        <div class="two">
+          <label class="field">
+            <span class="lbl" style="display:block;margin-bottom:7px">③ 拉取源 UA</span>
+            <select id="pullua">
+              <option value="clash" selected>Clash（clash.meta）</option>
+              <option value="auto">自动（跟随客户端 UA）</option>
+              <option value="v2rayng">v2rayNG</option>
+              <option value="v2rayn">v2rayN</option>
+              <option value="surge">Surge</option>
+              <option value="shadowrocket">Shadowrocket</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="lbl" style="display:block;margin-bottom:7px">④ 选择输出格式</span>
+            <select id="format">
+              <option value="clash" selected>Clash（mihomo YAML）</option>
+              <option value="auto">自动</option>
+              <option value="base64">Base64（v2ray 通用）</option>
+              <option value="plain">明文分享链接</option>
+            </select>
+          </label>
+        </div>
 
-		<div class="input-group">
-			<label style="display:flex;align-items:center;gap:8px;font-weight:500">
-				<input type="checkbox" id="tlsFix" style="width:auto;margin:0" checked>
-				按端口自动匹配 TLS（TLS 端口补 tls，明文端口去 tls；不勾选则保持源节点原样）
-			</label>
-			<label style="display:flex;align-items:center;gap:8px;font-weight:500;margin-top:.4rem">
-				<input type="checkbox" id="uaGen" style="width:auto;margin:0">
-				生成随机 User-Agent 头（默认不生成）
-			</label>
-		</div>
+        <div class="row" style="justify-content:space-between">
+          <div class="row">
+            <span class="chip" id="editingChip" hidden></span>
+          </div>
+          <div class="row">
+            <button class="btn" type="button" id="resetBtn">清空</button>
+            <button class="btn primary" type="submit" id="submitBtn">保存并更新</button>
+          </div>
+        </div>
+      </form>
+    </section>
 
-		<div class="row">
-			<div class="input-group">
-				<label for="num">生成数量</label>
-				<input type="number" id="num" min="1" placeholder="留空 = 全部">
-			</div>
-			<div class="input-group">
-				<label for="format">输出格式</label>
-				<select id="format" onchange="切换模板框()">
-					<option value="clash" selected>Clash 配置（默认）</option>
-					<option value="auto">自动（跟随源）</option>
-					<option value="base64">base64</option>
-					<option value="plain">明文</option>
-				</select>
-			</div>
-		</div>
+    <!-- 配置档 -->
+    <section class="card pad" id="profilesCard" hidden>
+      <div class="field-head">
+        <span class="lbl">我的配置档<span class="opt">绑定 KV 后保存的订阅</span></span>
+        <button class="btn ghost" type="button" id="refreshProfiles">刷新</button>
+      </div>
+      <div id="profilesList"><p class="hint">加载中…</p></div>
+    </section>
 
-		<div class="input-group" id="templateBox" style="display:none">
-			<label for="template">Clash 模板（可选）</label>
-			<textarea id="template" placeholder="留空 = 使用内置默认模板（含 mixed-port / dns / proxy-groups / rules）&#10;也可粘贴你自己的 config.yaml 覆盖：其中 proxies: 段会被改写后的节点替换，&#10;proxy-groups 里可用 __PROXIES_NAMES__ 占位符插入节点名列表。"></textarea>
-			<div class="hint">仅在「输出格式 = Clash 配置」且源为节点链接时生效；源本身是 Clash 配置时会原样改写，不动你的 groups/rules。</div>
-		</div>
+  </div>
 
-		<div class="input-group">
-			<label for="path">自定义路径（可选）</label>
-			<input type="text" id="path" placeholder="留空使用 /re">
-		</div>
+  <p class="foot">
+    仅处理 <code>IP</code> / <code>端口</code> / <code>节点名称</code>，绝不修改 tls、sni、ech-opts 等配置选项。<br>
+    <a href="https://github.com/yegetables/SpeedSub" target="_blank" rel="noopener">GitHub</a>
+  </p>
+</div>
 
-		<div class="input-group">
-			<button onclick="生成()">生成订阅地址</button>
-			<div class="status" id="genStatus"></div>
-		</div>
+<!-- 登录闸门 -->
+<div class="gate" id="loginGate" hidden>
+  <form class="box" id="loginForm">
+    <h2>管理口令</h2>
+    <p>此管理页已启用口令保护。<code>/s/</code> 订阅链接不受影响。</p>
+    <input type="password" id="loginPass" placeholder="请输入管理口令" autocomplete="current-password">
+    <div class="err-text" id="loginErr"></div>
+    <button class="btn primary" type="submit" style="width:100%;margin-top:14px" id="loginBtn">进入</button>
+  </form>
+</div>
 
-		<div class="input-group">
-			<label for="result">订阅地址</label>
-			<input type="text" id="result" readonly onclick="复制(this)">
-			<div id="qrcode"></div>
-		</div>
+<!-- 填写说明 -->
+<dialog id="helpDialog">
+  <div class="dlg-head">
+    <h3>📍 自定义优选与汇聚 · 填写说明</h3>
+    <button class="x" type="button" data-close="helpDialog">×</button>
+  </div>
+  <div class="dlg-body doc">
+    <p>一个输入框搞定所有：<b>优选 IP / 域名、IP API、汇聚订阅、现成节点</b>，每行一条，<code>#</code> 后写备注。</p>
 
-		<div class="section" id="profileSection">
-			<h2>配置档（需绑定 KV）</h2>
-			<div class="input-group">
-				<label for="profileList">已保存的配置档</label>
-				<select id="profileList" onchange="载入配置档(this.value)">
-					<option value="">— 选择一个配置档 —</option>
-				</select>
-			</div>
-			<div class="input-group">
-				<label for="label">名称</label>
-				<input type="text" id="label" placeholder="例如：主力线路">
-			</div>
-			<button class="ghost mini" onclick="保存配置档(false)">保存为新配置档</button>
-			<button class="ghost mini" onclick="保存配置档(true)">覆盖当前配置档</button>
-			<button class="ghost mini" onclick="删除配置档()">删除当前配置档</button>
-			<div class="status" id="profileStatus"></div>
-		</div>
-	</div>
+    <h4>一、优选 IP / 域名（直接写）</h4>
+    <ul>
+      <li><code>104.16.0.1</code> → 默认 443（TLS 池）</li>
+      <li><code>104.16.0.2:2053</code> → TLS 池</li>
+      <li><code>104.16.0.3:80</code> → 非 TLS 池</li>
+      <li><code>[2606:4700::1]:8443</code> → IPv6（带方括号）</li>
+      <li><code>cf.090227.xyz</code> → 优选域名，默认 443</li>
+      <li><code>104.16.0.4:443 #香港</code> → 行尾备注会写进节点名</li>
+    </ul>
 
-	<script>
-		var KV可用 = __KV_AVAILABLE__;
-		var 当前档 = '';
+    <h4>二、优选 IP API（自动拉取列表）</h4>
+    <ul>
+      <li><code>https://raw.githubusercontent.com/.../ips-v4.txt</code></li>
+      <li><code>sub://你的域名/path</code> → 自动补全为 <code>https://</code></li>
+      <li><code>https://github.com/user/repo/blob/main/list.txt</code> → 自动转 raw</li>
+      <li>也兼容 CloudflareST 导出的 CSV（<code>IP,已发送,已接收,...</code>）</li>
+    </ul>
 
-		function 取值(id) { return (document.getElementById(id).value || '').trim(); }
-		function 存储(key, val) { try { val === null ? localStorage.removeItem(key) : localStorage.setItem(key, val); } catch (e) {} }
-		function 读档(key) { try { return localStorage.getItem(key) || ''; } catch (e) { return ''; } }
+    <h4>三、汇聚订阅 / 现成节点（原样附加）</h4>
+    <ul>
+      <li><code>https://example.com/api/v1/client/subscribe?token=xxx</code></li>
+      <li><code>vless://uuid@host:port?...#节点名</code>（也支持 vmess / trojan / ss / hysteria2 / tuic / anytls）</li>
+    </ul>
 
-		function 填表() {
-			document.getElementById('url').value = 读档('url');
-			document.getElementById('add').value = 读档('add');
-			document.getElementById('addapi').value = 读档('addapi');
-			document.getElementById('num').value = 读档('num');
-			document.getElementById('format').value = 读档('format') || 'clash';
-			document.getElementById('template').value = 读档('template');
-			document.getElementById('path').value = 读档('path');
-			document.getElementById('listSrc').value = 读档('listSrc') || 'text';
-			document.getElementById('tlsFix').checked = 读档('tlsFix') !== '0';
-			document.getElementById('uaGen').checked = 读档('uaGen') === '1';
-			document.getElementById('pullua').value = 读档('pullua') || 'auto';
-			document.getElementById('pulluaCustom').value = 读档('pulluaCustom');
-			切换列表来源();
-			切换模板框();
-			切换拉取UA();
-		}
+    <h4>端口池规则</h4>
+    <ul>
+      <li><b>TLS 池</b>：443 / 2053 / 2083 / 2087 / 2096 / 8443</li>
+      <li><b>非 TLS 池</b>：80 / 8080 / 8880 / 2052 / 2082 / 2086 / 2095</li>
+      <li>TLS 节点只从 TLS 池取 IP，非 TLS 节点只从非 TLS 池取 IP，<b>绝不跨类型错配</b>。</li>
+      <li>某个类型没填优选时，后端保留该类型原节点并给出提示，不会拿另一种类型顶替。</li>
+    </ul>
 
-		function 存表() {
-			['url','add','addapi','num','format','template','path','listSrc','label'].forEach(function (k) { 存储(k, 取值(k)); });
-			存储('tlsFix', document.getElementById('tlsFix').checked ? '1' : '0');
-			存储('uaGen', document.getElementById('uaGen').checked ? '1' : '0');
-			存储('pullua', 取值('pullua'));
-			存储('pulluaCustom', 取值('pulluaCustom'));
-		}
+    <h4>工作原理</h4>
+    <ul>
+      <li>每个独立 CF 落地（按凭据 / 传输 / SNI / Host / path 归并）只保留 <b>1 条基准原节点</b>。</li>
+      <li>再把优选 <code>IP:端口</code> 依次追加为新节点并统一改名，原节点配置选项一个字符都不动。</li>
+      <li>整框留空 = <b>纯汇总模式</b>：只汇总、转换、去重，不识别 CF、不精简。</li>
+    </ul>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" type="button" data-close="helpDialog">知道了</button>
+  </div>
+</dialog>
 
-		function 切换列表来源() {
-			var 远程 = document.getElementById('listSrc').value === 'url';
-			document.getElementById('addBox').style.display = 远程 ? 'none' : '';
-			document.getElementById('addapiBox').style.display = 远程 ? '' : 'none';
-		}
+<!-- 缺类型提示 -->
+<dialog id="missingDialog">
+  <div class="dlg-head">
+    <h3>优选类型不完整</h3>
+    <button class="x" type="button" id="missingX">×</button>
+  </div>
+  <div class="dlg-body">
+    <div class="callout warn" id="missingText"></div>
+    <p class="hint">为安全起见，SpeedSub 不会用 TLS 优选去替换非 TLS 节点（反过来也一样）。你可以补全后再生成，或先按已提供的类型替换。</p>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" type="button" id="missingSupplement">去补充</button>
+    <button class="btn primary" type="button" id="missingProceed">仅替换已提供类型</button>
+  </div>
+</dialog>
 
-		function 切换模板框() {
-			document.getElementById('templateBox').style.display = 取值('format') === 'clash' ? '' : 'none';
-		}
+<!-- 二维码 -->
+<dialog id="qrDialog">
+  <div class="dlg-head">
+    <h3>订阅二维码</h3>
+    <button class="x" type="button" data-close="qrDialog">×</button>
+  </div>
+  <div class="dlg-body">
+    <div id="qrBox"><span class="hint" id="qrMsg">生成中…</span></div>
+    <p class="hint" style="text-align:center;margin-top:12px;word-break:break-all" id="qrUrl"></p>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" type="button" id="qrCopy">复制链接</button>
+    <button class="btn" type="button" data-close="qrDialog">关闭</button>
+  </div>
+</dialog>
 
-		function 切换拉取UA() {
-			document.getElementById('pulluaCustom').style.display = 取值('pullua') === 'custom' ? '' : 'none';
-		}
+<!-- 预览 -->
+<dialog id="previewDialog">
+  <div class="dlg-head">
+    <h3>结果预览</h3>
+    <button class="x" type="button" data-close="previewDialog">×</button>
+  </div>
+  <div class="dlg-body">
+    <div id="previewBody"></div>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" type="button" id="downloadBtn">下载结果文件</button>
+    <button class="btn" type="button" data-close="previewDialog">关闭</button>
+  </div>
+</dialog>
 
-		function 取拉取UA() {
-			var 选择 = 取值('pullua');
-			if (!选择 || 选择 === 'auto') return 'auto';
-			if (选择 === 'custom') return 取值('pulluaCustom');
-			return 选择;
-		}
+<div class="toast-wrap" id="toastWrap"></div>
 
-		function 组装查询() {
-			var 参数 = [];
-			var url = 取值('url');
-			var addapi = 取值('addapi');
-			var add = 取值('add');
-			if (url) 参数.push('url=' + encodeURIComponent(url));
-			if (document.getElementById('listSrc').value === 'url') {
-				if (addapi) 参数.push('addapi=' + encodeURIComponent(addapi));
-			} else if (add) {
-				参数.push('add=' + encodeURIComponent(add));
-			}
-			if (取值('num')) 参数.push('num=' + encodeURIComponent(取值('num')));
-			var format = 取值('format');
-			if (format && format !== 'clash') 参数.push('format=' + encodeURIComponent(format));
-			if (format === 'clash' && 取值('template')) 参数.push('template=' + encodeURIComponent(取值('template')));
-			if (!document.getElementById('tlsFix').checked) 参数.push('tls=0');
-			if (document.getElementById('uaGen').checked) 参数.push('ua=1');
-			var 拉取UA = 取拉取UA();
-			if (拉取UA !== 'auto') 参数.push('pullua=' + encodeURIComponent(拉取UA));
-			return 参数.join('&');
-		}
+<script>
+window.__SPEEDSUB__ = __SPEEDSUB_BOOT__;
+(function () {
+  'use strict';
 
-		function 展示订阅(地址, 状态文本) {
-			document.getElementById('result').value = 地址;
-			var 二维码 = document.getElementById('qrcode');
-			二维码.innerHTML = '';
-			new QRCode(二维码, { text: 地址, width: 220, height: 220, colorDark: '#4a60ea', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.L });
-			if (状态文本 !== undefined) 提示('genStatus', 状态文本, true);
-		}
+  var boot = window.__SPEEDSUB__ || {};
+  var $ = function (id) { return document.getElementById(id); };
+  var state = {
+    link: '',
+    editingId: '',
+    editingLabel: '',
+    previewText: '',
+    previewName: '',
+    profiles: []
+  };
 
-		function 生成() {
-			存表();
-			if (!取值('url')) { 提示('genStatus', '请填写源订阅地址（或直接粘贴节点链接）', false); return; }
-			var 远程列表 = document.getElementById('listSrc').value === 'url';
-			if (远程列表 && !取值('addapi')) { 提示('genStatus', '请填写实测优选列表 URL', false); return; }
-			if (!远程列表 && !取值('add')) { 提示('genStatus', '请填写实测优选列表', false); return; }
-			var 查询 = 组装查询();
-			var 路径 = 取值('path') || '/re';
-			if (路径.charAt(0) !== '/') 路径 = '/' + 路径;
-			var 地址 = location.origin + 路径 + '?' + 查询;
-			展示订阅(地址, '已生成。客户端订阅此地址；之后改配置后重新生成新地址即可。');
-		}
+  /* ------------------------------ 工具 ------------------------------ */
+  function toast(msg, tone) {
+    var el = document.createElement('div');
+    el.className = 'toast ' + (tone || '');
+    el.textContent = msg;
+    $('toastWrap').appendChild(el);
+    setTimeout(function () {
+      el.style.opacity = '0';
+      el.style.transform = 'translateY(8px)';
+      el.style.transition = 'all .25s';
+      setTimeout(function () { el.remove(); }, 260);
+    }, 3200);
+  }
 
-		function 复制(el) {
-			if (!el.value) return;
-			el.select();
-			navigator.clipboard.writeText(el.value).then(function () {
-				提示('genStatus', '已复制到剪贴板', true);
-			}).catch(function () { alert('复制失败，请手动复制'); });
-		}
+  function setCookie(name, value, days) {
+    document.cookie = name + '=' + encodeURIComponent(value) + '; Path=/; Max-Age=' + (days * 86400) + '; SameSite=Lax';
+  }
+  function getCookie(name) {
+    var m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.*+?^$()|[\]\\])/g, '\\$1') + '=([^;]*)'));
+    return m ? decodeURIComponent(m[1]) : '';
+  }
 
-		function 提示(id, 文本, 成功) {
-			var el = document.getElementById(id);
-			el.textContent = 文本;
-			el.className = 'status ' + (成功 ? 'ok' : 'err');
-		}
+  function api(method, url, body) {
+    var opt = { method: method, credentials: 'same-origin', headers: {} };
+    if (body !== undefined && body !== null) {
+      opt.headers['content-type'] = 'application/json';
+      opt.body = JSON.stringify(body);
+    }
+    return fetch(url, opt).then(function (res) {
+      return res.json().catch(function () {
+        return { ok: false, error: 'HTTP ' + res.status };
+      }).then(function (data) {
+        data = data || {};
+        data.__status = res.status;
+        if (res.status === 401 && data.needAuth) showLogin();
+        return data;
+      });
+    });
+  }
 
-		function 请求(url, 选项) {
-			return fetch(url, 选项).then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.error || r.status); return d; }); });
-		}
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
 
-		function 保存配置档(覆盖) {
-			if (!KV可用) { 提示('profileStatus', '未绑定 KV，当前为手动模式', false); return; }
-			存表();
-			var 负载 = {
-				url: 取值('url'), link: '', add: 取值('add'), addapi: 取值('addapi'),
-				num: 取值('num'), format: 取值('format') || 'auto', template: 取值('template'), label: 取值('label'),
-				tls: document.getElementById('tlsFix').checked ? '1' : '0',
-				ua: document.getElementById('uaGen').checked ? '1' : '0',
-				pullua: 取拉取UA()
-			};
-			var 地址 = '/api/profile' + (覆盖 && 当前档 ? '?id=' + encodeURIComponent(当前档) + '&k=' + encodeURIComponent(读档('k') || '') : '');
-			请求(地址, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(负载) })
-				.then(function (d) {
-					当前档 = d.id; 存储('k', d.k); 存储('id', d.id);
-					存储('短链_' + d.id, d.url);
-					展示订阅(d.url, '已保存为新配置档，短链已放入订阅地址框（KV 最终一致，稍等一两秒生效）');
-					刷新配置档列表();
-				})
-				.catch(function (e) { 提示('profileStatus', '保存失败：' + e.message, false); });
-		}
+  /* ------------------------------ 表单存取 ------------------------------ */
+  var FORM_KEY = 'ss_form_v1';
+  var ADD_COOKIE = 'speedsub_add';
 
-		function 载入配置档(id) {
-			if (!id) { 当前档 = ''; 存储('id', ''); return; }
-			当前档 = id;
-			请求('/api/profile?id=' + encodeURIComponent(id))
-				.then(function (d) {
-					document.getElementById('url').value = d.url || '';
-					document.getElementById('add').value = d.add || '';
-					document.getElementById('addapi').value = d.addapi || '';
-					document.getElementById('num').value = d.num || '';
-					document.getElementById('format').value = d.format || 'auto';
-					document.getElementById('template').value = d.template || '';
-					document.getElementById('tlsFix').checked = d.tls !== '0';
-					document.getElementById('uaGen').checked = d.ua === '1';
-					document.getElementById('pullua').value = (d.pullua && 拉取UA预设键[d.pullua] !== undefined) ? 拉取UA预设键[d.pullua] : (d.pullua ? 'custom' : 'auto');
-					document.getElementById('pulluaCustom').value = (document.getElementById('pullua').value === 'custom') ? (d.pullua || '') : '';
-					document.getElementById('label').value = d.label || '';
-					document.getElementById('listSrc').value = (d.addapi && !d.add) ? 'url' : 'text';
-					切换列表来源(); 切换模板框(); 存表();
-					var 已存短链 = 读档('短链_' + id);
-					if (已存短链) 展示订阅(已存短链, '已载入配置档「' + (d.label || id) + '」，短链已放入订阅地址框');
-					else { document.getElementById('result').value = ''; document.getElementById('qrcode').innerHTML = ''; 提示('profileStatus', '已载入配置档「' + (d.label || id) + '」；本设备未保存该档短链（保存一次即可生成）', true); }
-				})
-				.catch(function (e) { 提示('profileStatus', '载入失败：' + e.message, false); });
-		}
+  function gather() {
+    return {
+      url: $('url').value.trim(),
+      add: $('add').value.trim(),
+      format: $('format').value,
+      pullua: $('pullua').value
+    };
+  }
 
-		function 刷新配置档列表() {
-			if (!KV可用) return;
-			请求('/api/profile?action=list').then(function (d) {
-				var sel = document.getElementById('profileList');
-				sel.innerHTML = '<option value="">— 选择一个配置档 —</option>';
-				(d.list || []).forEach(function (p) {
-					var opt = document.createElement('option');
-					opt.value = p.id; opt.textContent = p.label + ' (' + p.id + ')';
-					sel.appendChild(opt);
-				});
-				if (当前档) sel.value = 当前档;
-			}).catch(function () {});
-		}
+  function saveForm() {
+    var cfg = gather();
+    try { localStorage.setItem(FORM_KEY, JSON.stringify(cfg)); } catch (e) {}
+    setCookie(ADD_COOKIE, cfg.add, 365);
+    updateModeChip();
+  }
 
-		function 删除配置档() {
-			if (!KV可用) { 提示('profileStatus', '未绑定 KV，当前为手动模式', false); return; }
-			if (!当前档) { 提示('profileStatus', '请先选择一个配置档', false); return; }
-			if (!confirm('确定删除配置档 ' + 当前档 + ' ？（此操作不可撤销）')) return;
-			请求('/api/profile?id=' + encodeURIComponent(当前档) + '&k=' + encodeURIComponent(读档('k') || ''), { method: 'DELETE' })
-				.then(function () { 提示('profileStatus', '已删除', true); 当前档 = ''; 存表(); 刷新配置档列表(); })
-				.catch(function (e) { 提示('profileStatus', '删除失败：' + e.message, false); });
-		}
+  function loadForm() {
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem(FORM_KEY) || 'null'); } catch (e) {}
+    if (saved) {
+      $('url').value = saved.url || '';
+      $('add').value = saved.add || '';
+      $('format').value = saved.format || 'clash';
+      $('pullua').value = saved.pullua || 'clash';
+    }
+    var cookieAdd = getCookie(ADD_COOKIE);
+    if (cookieAdd && (!saved || !saved.add)) $('add').value = cookieAdd;
+    updateModeChip();
+  }
 
-		var 拉取UA预设键 = { 'clash-verge/v2.0.0': 'clash', 'mihomo/1.19.28': 'mihomo', 'v2rayNG/1.9.16': 'v2rayng', 'v2rayN/7.13.5': 'v2rayn', 'Surge iOS/3374': 'surge', 'Shadowrocket/2.2.55': 'shadowrocket' };
+  function fillForm(cfg) {
+    $('url').value = cfg.url || '';
+    $('add').value = cfg.add || '';
+    $('format').value = cfg.format || 'clash';
+    $('pullua').value = cfg.pullua || 'clash';
+    saveForm();
+  }
 
-		function 初始化() {
-			var badge = document.getElementById('kvBadge');
-			if (KV可用) {
-				badge.textContent = 'KV 已绑定：支持配置档';
-				badge.className = 'badge on';
-			} else {
-				badge.textContent = '未绑定 KV：手动模式（功能完整，无配置档）';
-				badge.className = 'badge off';
-			}
-			document.getElementById('listSrc').onchange = 切换列表来源;
-			document.getElementById('pullua').onchange = 切换拉取UA;
-			填表();
-			当前档 = 读档('id');
-			刷新配置档列表();
-		}
+  function updateModeChip() {
+    var hasAdd = $('add').value.trim().length > 0;
+    var chip = $('modeChip');
+    chip.textContent = hasAdd ? 'CF 优选 / 汇聚模式' : '未填 = 纯汇总模式';
+    chip.style.color = hasAdd ? 'var(--primary)' : '';
+  }
 
-		初始化();
-	</script>
+  /* ------------------------------ 短链 ------------------------------ */
+  function buildReLink(cfg) {
+    var p = new URLSearchParams();
+    if (cfg.url) p.set('url', cfg.url);
+    if (cfg.add) p.set('add', cfg.add);
+    if (cfg.format && cfg.format !== 'clash') p.set('format', cfg.format);
+    if (cfg.pullua && cfg.pullua !== 'clash') p.set('pullua', cfg.pullua);
+    return location.origin + '/re?' + p.toString();
+  }
+
+  function showLink(link, modeLabel, hint) {
+    state.link = link;
+    $('linkCard').hidden = false;
+    $('shortLink').value = link;
+    $('shortLink').classList.remove('show');
+    $('revealBtn').textContent = '显示';
+    $('linkModeBadge').textContent = modeLabel || '订阅链接';
+    $('linkHint').textContent = hint || '';
+    try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch (e) {}
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(function () { toast('已复制', 'ok'); })
+        .catch(function () { fallbackCopy(text); });
+    }
+    fallbackCopy(text);
+    return Promise.resolve();
+  }
+  function fallbackCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); toast('已复制', 'ok'); } catch (e) { toast('复制失败，请手动选择', 'error'); }
+    ta.remove();
+  }
+
+  /* ------------------------------ 缺类型对话框 ------------------------------ */
+  var missingResolve = null;
+  function askMissing(mt) {
+    var parts = [];
+    if (mt.missingTls) parts.push('缺少 <b>TLS 优选</b>（443 / 2053 / 2083 / 2087 / 2096 / 8443）：检测到 ' + mt.cfTlsLandings + ' 个 TLS CF 落地，其原节点将保持原样。');
+    if (mt.missingNoTls) parts.push('缺少 <b>非 TLS 优选</b>（80 / 8080 / 8880 / 2052 / 2082 / 2086 / 2095）：检测到 ' + mt.cfNoTlsLandings + ' 个非 TLS CF 落地，其原节点将保持原样。');
+    $('missingText').innerHTML = parts.join('<br><br>');
+    var dlg = $('missingDialog');
+    dlg.showModal();
+    return new Promise(function (resolve) {
+      missingResolve = resolve;
+    });
+  }
+  function finishMissing(val) {
+    $('missingDialog').close();
+    if (missingResolve) { missingResolve(val); missingResolve = null; }
+  }
+  $('missingSupplement').addEventListener('click', function () { finishMissing('supplement'); });
+  $('missingProceed').addEventListener('click', function () { finishMissing('proceed'); });
+  $('missingX').addEventListener('click', function () { finishMissing('supplement'); });
+
+  /* ------------------------------ 预览 ------------------------------ */
+  function statCard(k, v, sub) {
+    return '<div class="stat"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + (sub ? ' <small>' + esc(sub) + '</small>' : '') + '</div></div>';
+  }
+
+  function showPreview(data) {
+    var body = $('previewBody');
+    if (!data || data.ok === false) {
+      body.innerHTML = '<div class="callout err">' + esc((data && data.error) || '预览失败') + '</div>';
+      state.previewText = '';
+      $('previewDialog').showModal();
+      return;
+    }
+    var s = data.stats || {};
+    var html = '';
+    html += '<div class="row" style="margin-bottom:12px">' +
+      '<span class="badge ' + (data.mode === 'cf-optimize' ? 'info' : 'muted') + '">' + (data.mode === 'cf-optimize' ? 'CF 优选模式' : '纯汇总模式') + '</span>' +
+      '<span class="badge muted">输出：' + esc(data.format) + '</span>' +
+      '<span class="badge ok">源成功 ' + esc(data.sourcesSummary || (s.sourcesOk + '/' + s.sourcesTotal)) + '</span>' +
+      '</div>';
+
+    html += '<div class="stats">';
+    html += statCard('输入节点', s.totalInputNodes == null ? '-' : s.totalInputNodes);
+    html += statCard('独立 CF 落地', s.cfLandings == null ? 0 : s.cfLandings);
+    html += statCard('TLS 落地', (s.cfTlsLandings || 0), '条 ' + (s.cfTlsNodeCount || 0));
+    html += statCard('非 TLS 落地', (s.cfNoTlsLandings || 0), '条 ' + (s.cfNoTlsNodeCount || 0));
+    html += statCard('保留原节点', s.keptOriginalNodes == null ? '-' : s.keptOriginalNodes);
+    html += statCard('Append 优选', s.appendedCfNodes == null ? 0 : s.appendedCfNodes);
+    html += statCard('汇聚附加', s.aggregatedExtraNodes == null ? 0 : s.aggregatedExtraNodes);
+    html += statCard('输出节点', s.outputTotalNodes == null ? '-' : s.outputTotalNodes);
+    html += statCard('TLS 优选池', s.preferredTlsCount == null ? 0 : s.preferredTlsCount);
+    html += statCard('非 TLS 优选池', s.preferredNoTlsCount == null ? 0 : s.preferredNoTlsCount);
+    html += '</div>';
+
+    if (data.warnings && data.warnings.length) {
+      html += '<div class="callout warn"><b>提示</b><ul>' + data.warnings.map(function (w) { return '<li>' + esc(w) + '</li>'; }).join('') + '</ul></div>';
+    }
+    if (s.sourceErrors && s.sourceErrors.length) {
+      html += '<div class="callout warn"><b>失败的源（已跳过）</b><ul>' + s.sourceErrors.slice(0, 12).map(function (e) {
+        return '<li>' + esc(e.url) + '：' + esc(e.error) + '</li>';
+      }).join('') + '</ul></div>';
+    }
+
+    state.previewText = data.result || '';
+    state.previewName = data.format === 'clash' ? 'speedsub-clash.yaml' : 'speedsub-nodes.txt';
+    var shown = state.previewText;
+    var truncated = false;
+    if (shown.length > 60000) { shown = shown.slice(0, 60000); truncated = true; }
+    html += '<div class="lbl" style="font-size:.82rem;font-weight:600;margin:4px 0 7px">结果文件' + (truncated ? '（已截断显示，下载可得完整内容）' : '') + '</div>';
+    html += '<pre>' + esc(shown) + '</pre>';
+
+    body.innerHTML = html;
+    $('previewDialog').showModal();
+  }
+
+  $('downloadBtn').addEventListener('click', function () {
+    if (!state.previewText) { toast('暂无可下载内容', 'warn'); return; }
+    var blob = new Blob([state.previewText], { type: 'text/plain;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = state.previewName || 'speedsub-result.txt';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  });
+
+  /* ------------------------------ 保存流程 ------------------------------ */
+  var busy = false;
+  function setBusy(v) {
+    busy = v;
+    var btn = $('submitBtn');
+    btn.disabled = v;
+    btn.innerHTML = v ? '<span class="spin"></span> 处理中…' : '保存并更新';
+  }
+
+  $('form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (busy) return;
+    var cfg = gather();
+    if (!cfg.url && !cfg.add) { toast('请至少填写源订阅或自定义优选', 'error'); return; }
+    saveForm();
+    setBusy(true);
+
+    api('POST', '/api/preview', cfg).then(function (prev) {
+      if (!prev || prev.ok === false) {
+        toast((prev && prev.error) || '生成失败', 'error');
+        if (prev && prev.stats) showPreview(prev);
+        return;
+      }
+      var mt = prev.missingTypes || {};
+      var needAsk = mt.missingTls || mt.missingNoTls;
+      var gate = needAsk ? askMissing(mt) : Promise.resolve('proceed');
+      return gate.then(function (choice) {
+        if (choice === 'supplement') {
+          $('add').scrollIntoView({ behavior: 'smooth', block: 'center' });
+          $('add').focus();
+          toast('请在「自定义优选与汇聚」中补全缺失类型', 'warn');
+          return null;
+        }
+        var savePromise;
+        if (boot.kvAvailable && boot.authed !== false) {
+          savePromise = api('POST', '/api/profile' + (state.editingId ? ('?id=' + encodeURIComponent(state.editingId)) : ''), cfg)
+            .then(function (saved) {
+              if (saved && saved.ok && (saved.shortUrl || saved.url)) {
+                return { link: saved.shortUrl || saved.url, mode: 'KV 短链', hint: '订阅链接已保存，节点会随源订阅实时更新。' };
+              }
+              if (saved && saved.__status === 501) {
+                return { link: buildReLink(cfg), mode: '临时直连', hint: '未绑定 KV，已回退为 /re 直连链接。' };
+              }
+              if (saved && saved.needAuth) throw new Error('需要管理口令');
+              throw new Error((saved && saved.error) || '保存失败');
+            })
+            .catch(function (err) {
+              return { link: buildReLink(cfg), mode: '临时直连', hint: '保存失败（' + err.message + '），已回退为 /re 直连链接。' };
+            });
+        } else {
+          savePromise = Promise.resolve({ link: buildReLink(cfg), mode: '临时直连', hint: '未绑定 KV，已生成 /re 直连链接；链接较长时建议绑定 KV。' });
+        }
+        return savePromise.then(function (r) {
+          showLink(r.link, r.mode, r.hint);
+          state.previewText = prev.result || '';
+          state.previewName = prev.format === 'clash' ? 'speedsub-clash.yaml' : 'speedsub-nodes.txt';
+          toast('已生成订阅链接', 'ok');
+          if (boot.kvAvailable && state.editingId) loadProfiles();
+        });
+      });
+    }).catch(function (err) {
+      toast('网络错误：' + err.message, 'error');
+    }).then(function () {
+      setBusy(false);
+    });
+  });
+
+  /* ------------------------------ 预览按钮 ------------------------------ */
+  $('previewBtn').addEventListener('click', function () {
+    var cfg = gather();
+    if (!state.link && !cfg.url && !cfg.add) { toast('请先生成订阅', 'warn'); return; }
+    var body = (cfg.url || cfg.add) ? cfg : null;
+    if (!body && state.editingId) body = { profileId: state.editingId };
+    if (!body) { toast('当前没有可预览的配置', 'warn'); return; }
+    toast('正在拉取并计算…', '');
+    api('POST', '/api/preview', body).then(function (data) {
+      showPreview(data);
+    }).catch(function (err) {
+      toast('预览失败：' + err.message, 'error');
+    });
+  });
+
+  /* ------------------------------ 短链按钮 ------------------------------ */
+  $('copyBtn').addEventListener('click', function () {
+    if (!state.link) return;
+    copyText(state.link);
+  });
+  $('revealBtn').addEventListener('click', function () {
+    var i = $('shortLink');
+    var shown = i.classList.toggle('show');
+    $('revealBtn').textContent = shown ? '隐藏' : '显示';
+  });
+  $('openLinkBtn').addEventListener('click', function () {
+    if (state.link) window.open(state.link, '_blank', 'noopener');
+  });
+  $('qrCopy').addEventListener('click', function () { if (state.link) copyText(state.link); });
+  $('qrBtn').addEventListener('click', function () {
+    if (!state.link) return;
+    $('qrUrl').textContent = state.link;
+    var box = $('qrBox');
+    box.innerHTML = '<span class="hint" id="qrMsg">加载二维码组件…</span>';
+    $('qrDialog').showModal();
+    loadQrLib().then(function () {
+      box.innerHTML = '';
+      try {
+        new QRCode(box, { text: state.link, width: 244, height: 244, correctLevel: QRCode.CorrectLevel.M });
+      } catch (e) {
+        box.innerHTML = '<span class="hint">二维码生成失败，请直接复制链接</span>';
+      }
+    }).catch(function () {
+      box.innerHTML = '<span class="hint">二维码组件加载失败，请复制链接使用</span>';
+    });
+  });
+
+  var qrPromise = null;
+  function loadQrLib() {
+    if (window.QRCode) return Promise.resolve();
+    if (qrPromise) return qrPromise;
+    qrPromise = new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/@keeex/qrcodejs-kx@1.0.2/qrcode.min.js';
+      s.onload = function () { resolve(); };
+      s.onerror = function () { reject(new Error('load failed')); };
+      document.head.appendChild(s);
+      setTimeout(function () { if (!window.QRCode) reject(new Error('timeout')); }, 8000);
+    });
+    return qrPromise;
+  }
+
+  /* ------------------------------ 配置档 ------------------------------ */
+  function loadProfiles() {
+    if (!boot.kvAvailable) { $('profilesCard').hidden = true; return; }
+    if (boot.adminProtected && !boot.authed) { $('profilesCard').hidden = true; return; }
+    $('profilesCard').hidden = false;
+    $('profilesList').innerHTML = '<p class="hint">加载中…</p>';
+    api('GET', '/api/profile').then(function (data) {
+      if (data && data.list) {
+        state.profiles = data.list;
+        renderProfiles(data.list);
+      } else if (data && data.__status === 501) {
+        $('profilesList').innerHTML = '<p class="hint">KV 未绑定，使用 /re 直连模式。</p>';
+      } else {
+        $('profilesList').innerHTML = '<p class="hint">' + esc((data && data.error) || '加载失败') + '</p>';
+      }
+    }).catch(function (err) {
+      $('profilesList').innerHTML = '<p class="hint">加载失败：' + esc(err.message) + '</p>';
+    });
+  }
+
+  function renderProfiles(list) {
+    if (!list.length) {
+      $('profilesList').innerHTML = '<p class="hint">还没有保存的配置档。填好上方表单点「保存并更新」即可创建。</p>';
+      return;
+    }
+    $('profilesList').innerHTML = list.map(function (p) {
+      return '<div class="profile-item" data-id="' + esc(p.id) + '">' +
+        '<div class="pi-main">' +
+          '<div class="pi-name">' + esc(p.label || p.id) +
+            ' <span class="badge muted">' + esc(p.format || 'clash') + '</span>' +
+            ' <span class="badge muted">' + esc(p.pullua || 'clash') + '</span>' +
+          '</div>' +
+          '<div class="pi-meta">' + esc(p.shortUrl || (location.origin + '/s/' + p.id)) + '</div>' +
+          '<div class="pi-meta">更新：' + esc(p.updated || '-') + '</div>' +
+        '</div>' +
+        '<div class="pi-actions">' +
+          '<button class="btn sm" data-act="load">载入</button>' +
+          '<button class="btn sm" data-act="preview">预览</button>' +
+          '<button class="btn sm" data-act="copy">复制</button>' +
+          '<button class="btn sm danger" data-act="delete">删除</button>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  $('profilesList').addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-act]');
+    if (!btn) return;
+    var item = btn.closest('.profile-item');
+    var id = item && item.getAttribute('data-id');
+    if (!id) return;
+    var prof = null;
+    for (var i = 0; i < state.profiles.length; i++) { if (state.profiles[i].id === id) { prof = state.profiles[i]; break; } }
+    var act = btn.getAttribute('data-act');
+
+    if (act === 'copy' && prof) { copyText(prof.shortUrl); return; }
+
+    if (act === 'preview') {
+      toast('正在拉取并计算…', '');
+      api('POST', '/api/preview', { profileId: id }).then(showPreview).catch(function (err) { toast('预览失败：' + err.message, 'error'); });
+      return;
+    }
+
+    if (act === 'delete') {
+      if (!confirm('确定删除配置档「' + ((prof && prof.label) || id) + '」？删除后短链立即失效。')) return;
+      deleteProfile(id, prof);
+      return;
+    }
+
+    if (act === 'load') {
+      api('GET', '/api/profile?id=' + encodeURIComponent(id)).then(function (data) {
+        if (!data || data.error) { toast((data && data.error) || '载入失败', 'error'); return; }
+        fillForm(data);
+        state.editingId = id;
+        state.editingLabel = data.label || id;
+        $('editingChip').hidden = false;
+        $('editingChip').innerHTML = '正在编辑：' + esc(state.editingLabel) + ' <button type="button" id="cancelEdit">取消</button>';
+        var cancel = $('cancelEdit');
+        if (cancel) cancel.addEventListener('click', function () {
+          state.editingId = ''; state.editingLabel = '';
+          $('editingChip').hidden = true;
+          toast('已退出编辑，下一次保存将新建配置档', '');
+        });
+        if (prof && prof.shortUrl) showLink(prof.shortUrl, 'KV 短链', '已载入配置档，可修改后保存更新。');
+        toast('已载入配置档', 'ok');
+      }).catch(function (err) { toast('载入失败：' + err.message, 'error'); });
+    }
+  });
+
+  function deleteProfile(id, prof) {
+    if (!prof) return;
+    api('DELETE', '/api/profile?id=' + encodeURIComponent(id) + '&k=' + encodeURIComponent(prof.k || '')).then(function (data) {
+      if (data && data.ok) {
+        toast('已删除', 'ok');
+        loadProfiles();
+        if (state.editingId === id) {
+          state.editingId = ''; state.editingLabel = '';
+          $('editingChip').hidden = true;
+        }
+      } else {
+        toast((data && data.error) || '删除失败', 'error');
+      }
+    }).catch(function (err) { toast('删除失败：' + err.message, 'error'); });
+  }
+
+  $('refreshProfiles').addEventListener('click', loadProfiles);
+
+  /* ------------------------------ 登录 ------------------------------ */
+  function showLogin() {
+    $('loginGate').hidden = false;
+    setTimeout(function () { try { $('loginPass').focus(); } catch (e) {} }, 60);
+  }
+  $('loginForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var pass = $('loginPass').value;
+    if (!pass) { $('loginErr').textContent = '请输入口令'; return; }
+    $('loginBtn').disabled = true;
+    api('POST', '/api/auth', { pass: pass }).then(function (data) {
+      if (data && data.ok) { location.reload(); return; }
+      $('loginErr').textContent = (data && data.error) || '口令不正确';
+    }).catch(function (err) {
+      $('loginErr').textContent = '网络错误：' + err.message;
+    }).then(function () { $('loginBtn').disabled = false; });
+  });
+
+  $('logoutBtn').addEventListener('click', function () {
+    api('POST', '/api/logout').then(function () { location.reload(); });
+  });
+
+  /* ------------------------------ 其他交互 ------------------------------ */
+  Array.prototype.forEach.call(document.querySelectorAll('[data-close]'), function (btn) {
+    btn.addEventListener('click', function () {
+      var d = $(btn.getAttribute('data-close'));
+      if (d) d.close();
+    });
+  });
+  $('openHelp').addEventListener('click', function () { $('helpDialog').showModal(); });
+
+  $('resetBtn').addEventListener('click', function () {
+    if (!confirm('清空当前表单内容？')) return;
+    $('url').value = '';
+    $('add').value = '';
+    $('format').value = 'clash';
+    $('pullua').value = 'clash';
+    state.editingId = ''; state.editingLabel = '';
+    $('editingChip').hidden = true;
+    try { localStorage.removeItem(FORM_KEY); } catch (e) {}
+    setCookie(ADD_COOKIE, '', 0);
+    updateModeChip();
+    toast('已清空', '');
+  });
+
+  var saveTimer = null;
+  ['url', 'add', 'format', 'pullua'].forEach(function (id) {
+    $(id).addEventListener('input', function () {
+      updateModeChip();
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(saveForm, 400);
+    });
+    $(id).addEventListener('change', saveForm);
+  });
+
+  /* ------------------------------ 初始化 ------------------------------ */
+  loadForm();
+
+  if (boot.adminProtected) {
+    $('adminBadge').hidden = !boot.authed;
+    $('logoutBtn').hidden = !boot.authed;
+    if (!boot.authed) showLogin();
+  }
+
+  if (boot.kvAvailable) {
+    var kb = $('kvBadge');
+    kb.hidden = false;
+    kb.textContent = 'KV 已绑定';
+  }
+
+  // 页面带参数时自动回填（?url=&add=&format=&pullua=）
+  (function () {
+    var p = new URLSearchParams(location.search);
+    if (p.has('url') || p.has('add')) {
+      if (p.has('url')) $('url').value = p.get('url');
+      if (p.has('add')) $('add').value = p.get('add');
+      if (p.has('format')) $('format').value = p.get('format');
+      if (p.has('pullua')) $('pullua').value = p.get('pullua');
+      saveForm();
+    }
+  })();
+
+  if (boot.kvAvailable && (!boot.adminProtected || boot.authed)) loadProfiles();
+})();
+</script>
 </body>
 </html>`;
 
-// ---------------- 入口 ----------------
+// ---------------- Worker 入口 ----------------
 
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
-		const 路径 = url.pathname.replace(/\/+$/, '') || '/';
-		const 用户代理 = (request.headers.get('User-Agent') || '').toLowerCase();
+		const pathname = url.pathname.replace(/\/+$/, '') || '/';
+		const clientUA = (request.headers.get('User-Agent') || '').toLowerCase();
 
 		try {
-			if (路径 === '/' || 路径 === '/index.html') {
-				return 页面(!!(env && env[KV绑定名]));
+			if (pathname === '/' || pathname === '/index.html') {
+				return await renderPage(request, env);
+			}
+			if (pathname === '/api/health') {
+				return jsonResponse({
+					ok: true,
+					kv: !!(env && env[KV_BINDING]),
+					adminProtected: !!getAdminPass(env),
+					version: '2.0'
+				});
+			}
+			if (pathname === '/api/auth') {
+				return await handleAuthApi(request, url, env);
+			}
+			if (pathname === '/api/logout') {
+				return handleLogoutApi(url);
+			}
+			if (pathname.startsWith('/api/profile')) {
+				return await handleProfileApi(request, url, env);
+			}
+			if (pathname === '/api/preview') {
+				return await handlePreviewApi(request, url, clientUA, env);
+			}
+			if (pathname.startsWith('/s/')) {
+				return await handleProfileSub(request, url, pathname, clientUA, env);
 			}
 
-			if (路径.startsWith('/api/profile')) {
-				return await 处理配置档接口(request, url, env);
-			}
-
-			if (路径.startsWith('/s/')) {
-				return await 处理配置档订阅(request, url, 路径, 用户代理, env);
-			}
-
-			// 其余路径只要带改写相关参数即视为临时直连
-			if (url.searchParams.has('url') || url.searchParams.has('link') || url.searchParams.has('add') || url.searchParams.has('addapi')) {
-				return await 改写订阅({
+			// /re 或任意路径带转换参数 → 临时直连转换
+			if (pathname === '/re' || url.searchParams.has('url') || url.searchParams.has('link') || url.searchParams.has('add') || url.searchParams.has('addapi')) {
+				const res = await runSpeedSubPipeline({
 					url: url.searchParams.get('url') || '',
 					link: url.searchParams.get('link') || '',
 					add: url.searchParams.get('add') || '',
@@ -1674,18 +3345,37 @@ export default {
 					num: url.searchParams.get('num') || '',
 					format: url.searchParams.get('format') || 'clash',
 					template: url.searchParams.get('template') || '',
-					tls: url.searchParams.get('tls') || '1',
 					ua: url.searchParams.get('ua') || '0',
-					pullua: url.searchParams.get('pullua') || 'auto'
-				}, 用户代理, request.headers.get('User-Agent') || '');
+					pullua: url.searchParams.get('pullua') || 'clash'
+				}, clientUA, request.headers.get('User-Agent') || '');
+				return makeSubscriptionResponse(res, url);
 			}
 
-			return new Response('Not Found', { status: 404, headers: 订阅头() });
-		} catch (错误) {
-			return new Response('Error: ' + (错误 && 错误.message ? 错误.message : String(错误)), {
+			return new Response('Not Found', { status: 404, headers: subHeaders() });
+		} catch (err) {
+			return new Response('Error: ' + (err && err.message ? err.message : String(err)), {
 				status: 500,
-				headers: 订阅头()
+				headers: subHeaders()
 			});
 		}
 	}
+};
+
+// 供本地 Node 测试按需引用（不影响 Cloudflare Worker 运行）
+export {
+	extractSources,
+	parsePreferredEntry,
+	classifyPreferredPools,
+	parseAllInOneRaw,
+	isCloudflareIP,
+	detectCFNodes,
+	parseClashYamlNodes,
+	parseShareUri,
+	cloneNodeWithAddress,
+	clashNodeToShareUri,
+	uriNodeToClashObj,
+	runSpeedSubPipeline,
+	buildClashOutput,
+	resolvePullUA,
+	normalizeGitHubRawUrl
 };

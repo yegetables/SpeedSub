@@ -1,44 +1,84 @@
-# SpeedSub · 实测优选订阅改写器
+# SpeedSub · 多订阅汇总 + Cloudflare 优选加速器
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/yegetables/SpeedSub)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 
-把 **Cloudflare 节点订阅 / 自建订阅 / 节点链接**里的节点「地址:端口」，按位置替换成**你自己实测的优选 IP 列表**，其余连接参数（uuid、path、Host、传输层配置）逐字保留，输出成你自己的订阅。
+一个单文件 Cloudflare Worker，同时做两件事：
 
-> 典型场景：你手里有一份能用的订阅，但它的优选线路是别人测的；你自己跑测速得到一批更快的优选 IP（IPv4/IPv6、指定端口）。SpeedSub 把两者合到一起：**连接方式用源订阅的，线路用你实测的**。
->
-> 本项目由 [cmliu/WorkerVless2sub](https://github.com/cmliu/WorkerVless2sub) 重写而来，但用途已完全不同：不是"从模板生成订阅"，而是"改写既有订阅"。
+1. **多订阅汇总转换器** —— 把任意多个订阅源（Clash YAML / base64 / 明文分享链接）合并成一份，并在 Clash 与 base64 / 明文之间双向转换、全局去重。
+2. **Cloudflare 优选 IP 加速器** —— 只改节点的 **IP（`server`）、端口（`port`）、名称（`name`）**，把源订阅里的 CF 节点换成你实测的优选 IP；`tls`、`sni`、`ech-opts`、`ws-opts`、`reality` 等配置选项**一个字节都不动**。
 
-## ⚠️ 重要前提：源节点必须在 Cloudflare 后面
+> 典型场景：手里有几份能用的订阅，但优选线路是别人测的。SpeedSub 把它们汇总成一份，再把 CF 节点接到你自己跑出来的优选 IP 上：**连接方式用源订阅的，线路用你实测的**。
 
-优选 IP 的原理是**加速「你 → Cloudflare 边缘」这一段链路**，它只对走 Cloudflare 的流量有意义。因此**源订阅的节点必须是 Cloudflare 节点（或链式挂在 CF 后面的节点）**：
+---
 
-```
-✔ 可行：你 → CF边缘(实测IP) → 源节点源站(Worker/橙色云域名) → 目标网站
-✔ 可行：你 → CF边缘(实测IP) → 源节点源站 → 另一节点 → 目标网站（链式）
-✘ 不可行：你 → CF边缘(实测IP) → 裸VPS（源站不在CF后面）
-```
+## 核心原则
 
-**判定方法**：源节点的 `host`（ws 头）/`sni`/`servername`/`server` 至少有一个是**橙色云代理的域名**（Worker 域名、开了 CF 代理的站点）。edgetunnel 类自建订阅、以及卖"CF Worker 节点"的服务都天然满足；**机场的普通 VPS 节点不是**。
+**只动三个字段：`server`（IP）、`port`（端口）、`name`（名称）。**
 
-**非 CF 节点替换后必然连不上**（优选 IP 指向 CF 边缘，边缘不会转发给不在 CF 后面的源站）。工具不做自动校验，请自查源订阅；替换永远只改地址/端口/名称，其余参数保留，所以喂什么源就产什么。
+其余所有配置——`tls`、`servername` / `sni`、`ech-opts`、`ws-opts` / `grpc-opts` / `xhttp-opts`、`reality-opts`、`client-fingerprint`、`flow`、`alpn`……——原样保留。这是硬约束，也是它和「重建节点」类工具最大的区别。
+
+---
+
+## 两种模式
+
+| | 纯汇总模式 | CF 优选模式 |
+|---|---|---|
+| **触发条件** | 「自定义优选与汇聚」留空 | 填了优选 IP / 域名 / IP API |
+| **行为** | 多源并发聚合 + 格式双向转换 + 全局去重；不识别 CF、不精简、不改写 | 三层识别 CF 节点 → 每个独立落地保留 1 条基准原节点 → 追加优选 IP 节点 |
+| **缺类型提示** | 不提示 | 有缺口时弹窗，让你「去补充」或「仅替换已提供类型」 |
+
+纯汇总模式下，源订阅里有什么就输出什么，只是去重并按你选的格式导出。
+
+---
+
+## CF 优选模式怎么工作
+
+### 1. 三层识别 CF 节点
+
+1. **CF 官方 CIDR** —— IPv4 / IPv6 地址直接匹配 Cloudflare 网段；
+2. **域名与传输特征** —— `*.workers.dev` / `*.pages.dev`，或 `ws / grpc / xhttp / httpupgrade` 传输命中 CF CDN 端口族与常见优选域名；
+3. **Cloudflare DoH 兜底** —— 前两层不确定时，用 `cloudflare-dns.com` 查询 A / AAAA 是否落在 CF 段。
+
+非 CF 节点（含 Reality、Hysteria2、TUIC、SS、WireGuard、信息节点）一律**原样保留**，不参与改写。
+
+### 2. 独立落地归并
+
+按 `类型 + 凭据 + 传输 + TLS 状态 + SNI + Host + path` 生成落地指纹。同一个 CF 落地无论源订阅里有多少个不同 IP 的副本，**只保留 1 条基准原节点**，其余丢弃，避免输出膨胀。
+
+### 3. 严格对号配对，绝不跨类型错配
+
+| 池 | 端口 |
+|---|---|
+| **TLS 优选池** | `443` `2053` `2083` `2087` `2096` `8443` |
+| **非 TLS 优选池** | `80` `8080` `8880` `2052` `2082` `2086` `2095` |
+
+- TLS 基准节点只从 TLS 池取 `IP:端口`，非 TLS 基准节点只从非 TLS 池取；
+- 省略端口的优选条目默认按 `443`（TLS 池）处理；
+- 某个类型没有提供优选时，**保留该类型的原节点并给出警告**，绝不会拿另一种类型的 IP 顶上；
+- 前端检测到缺口会弹窗：**去补充** 或 **仅替换已提供类型**。
+
+### 4. 追加而非覆盖
+
+保留基准原节点之后再追加优选节点，统一命名为 `[CF优选] 原节点名 · 优选标签`。这样客户端里既有原始可用节点，也有全部优选线路，互不影响。
 
 ---
 
 ## 特性
 
-- **按位置一一配对**（不是乘法）：第 i 条实测 → 第 i 个节点；实测多于节点时，超出部分用第 1 个节点的参数继续配；节点多于实测时，多余的**整条删除**（proxies 只剩实测条数）
-- **三要素 TLS 一致性**：源节点、实测端口族、最终配置自动对齐（全 TLS 或全明文），最终配置显式写出 `tls: true/false`
-- **改写而非重建**：源节点里工具不认识的参数（fp、pbk、ws headers、未来新字段）原样保留；认不出的协议原样透传，不弄坏订阅
-- **拉取 UA 可指定**：自适应订阅按拉取端 UA 返回不同格式，可强制按 Clash / v2rayNG / v2rayN / Surge / Shadowrocket 的 UA 拉取
-- **随机 User-Agent 头**（可选）：给导出的 Clash 节点生成随机浏览器 UA
-- 源格式：base64 节点列表、明文节点列表、**Clash YAML（块式与流式 `{...}` 都支持）**
-- 输出：跟随源格式 / base64 / 明文 / **完整 Clash 配置**（内置默认模板，可粘贴自己的模板覆盖）
-- Clash 导出支持 **vless（含 Reality）/ vmess / trojan / ss / hysteria2 / tuic / anytls**；ssr 等暂不支持导出的节点自动跳过并注释
-- **KV 配置档（可选）**：保存配置、生成短地址；未绑定 KV 时全功能可用（手动模式）
-- 单文件 Worker，无任何构建与运行时依赖
-
-**不做什么**：不添加 `udp`（优选 Worker 节点不支持 UDP relay）；不做订阅转换（YAML/链接互转请配合 subconverter 类工具）。
+- **多源并发聚合**：`Promise.allSettled`，单源失败自动跳过并在结果里报告，不影响其他源
+- **输入宽容**：源订阅每行可混写 `http(s)://` 链接、`sub://`、明文分享链接；中文说明、符号、空行静默忽略；自动去重
+- **格式自适应**：自动识别 Clash YAML（块式 + 流式 `{...}`）、base64 列表、明文列表
+- **双向转换**：Clash YAML ↔ base64 / 明文，覆盖 `vless`（含 Reality）/ `vmess` / `trojan` / `ss` / `hysteria2` / `tuic` / `anytls`
+- **全局重名去重**：同名节点自动追加 `-2`、`-3` 后缀
+- **多合一输入框**：优选域名 / IPv4 / IPv6 / IP API / 汇聚机场订阅 / 现成节点混写，行尾 `#备注`
+- **GitHub 直链纠正**：`github.com/.../blob/...` 自动转 `raw.githubusercontent.com/...`
+- **CloudflareST CSV 兼容**：直接粘贴测速 CSV 也能识别第一列 IP
+- **KV 配置档（可选）**：保存配置、生成固定短链；未绑定 KV 时自动回退 `/re?...` 直连链接，全功能可用
+- **可选管理口令**：设置 `ADMIN_PASS` 后保护管理页与管理 API；`/s/*` 订阅链接不受影响
+- **预览**：短链旁「预览」按钮可查看真实拉取统计、缺类型警告和完整结果文件
+- **Cookie 记忆**：自定义优选与汇聚内容写进 Cookie，刷新后自动回填
+- 单文件 Worker，无构建、无运行时依赖
 
 ---
 
@@ -46,7 +86,7 @@
 
 ### 方式一：Cloudflare Workers 一键部署（推荐）
 
-点击上面的 **Deploy to Cloudflare Workers** 按钮，授权后按提示完成，即可得到一个属于你的 Worker。部署完成打开 Worker 地址就是配置页面，**默认无需任何环境变量即可使用全部功能**。
+点击顶部 **Deploy to Cloudflare Workers** 按钮，授权后按提示完成。部署完成打开 Worker 地址就是配置页面，**默认无需任何环境变量即可使用全部功能**。
 
 ### 方式二：Dashboard 手动部署
 
@@ -65,7 +105,7 @@ npx wrangler@4 deploy        # 部署名在 wrangler.toml 的 name 里，可自�
 
 ### 方式四：连接 Git 仓库（push 自动部署，推荐长期使用）
 
-把仓库连到 Worker 后，**每次 `git push` 自动构建并部署**，改配置/改代码零手工操作。
+把仓库连到 Worker 后，**每次 `git push` 自动构建并部署**。
 
 1. Workers → 你的 Worker → **设置 → 构建** → 连接 Git 仓库 → 选本仓库、分支 `main`
 2. **添加构建变量**（敏感文本）：`KV_NAMESPACE_ID` = 你的 KV namespace id
@@ -83,7 +123,7 @@ sh -c 'sed "s/在此填入你的 KV namespace id/$KV_NAMESPACE_ID/" wrangler.pro
 
 ## 启用配置档（可选）
 
-绑定 KV 后可获得「保存配置档 + 短订阅地址」：改配置后客户端刷新即生效，无需换链接。
+绑定 KV 后可获得「保存配置档 + 固定短订阅地址」：改配置后客户端刷新即生效，无需换链接。
 
 1. Cloudflare 控制台 → **存储和数据库 → KV**：创建一个 namespace（名称随意）
 2. **Workers → 你的 Worker → 设置 → 绑定**：添加 KV Namespace，**变量名必须填 `SpeedSub_KV`**
@@ -91,102 +131,127 @@ sh -c 'sed "s/在此填入你的 KV namespace id/$KV_NAMESPACE_ID/" wrangler.pro
 
 短地址形如 `https://你的域名/s/<档id>?k=<密钥>`。**源订阅里含你的节点凭据（uuid 等），`k` 密钥请与短地址一起保管**。
 
+### 管理口令（可选）
+
+在 Worker 设置里添加环境变量/密钥 `ADMIN_PASS`，此后：
+
+- 打开管理页需要输入口令；
+- `/api/profile`、`/api/preview` 需要登录 Cookie；
+- **`/s/<id>?k=...` 与 `/re?...` 不受影响**，客户端照常拉取。
+
 > 想让 KV id 不进 git：复制 `wrangler.prod.toml.example` 为 `wrangler.prod.toml` 填入 id（已 gitignore），用 `npx wrangler@4 deploy -c wrangler.prod.toml` 部署。注意任何不带该绑定的部署都会清掉 KV 绑定。
 
 ---
 
 ## 使用
 
-**三步上手**：① 部署后打开 Worker 地址；② 贴源订阅 + 实测列表（文本或远程 URL）；③ 点「生成订阅地址」复制给客户端。之后要改，只改②再点生成；绑定了 KV 就「保存为新配置档」用固定短链。
+**三步上手**：① 打开 Worker 地址；② 填源订阅，需要优选时再填「自定义优选与汇聚」；③ 点「保存并更新」拿到订阅链接。
 
-打开页面后的字段说明：
+页面字段：
 
 | 字段 | 说明 |
 |---|---|
-| **源订阅地址** | Cloudflare 节点订阅 / 自建订阅 URL；也可以直接粘贴节点链接（每行一个） |
-| **拉取源订阅的客户端类型** | 自适应订阅按 UA 返回不同内容。默认自动跟随；要拿 Clash YAML 选 **Clash**（输出格式建议同时选 Clash 配置） |
-| **实测优选列表** | 每行一条：`ip:端口`、`ip:端口#名称`、`[IPv6]:端口`、裸 `IPv6:端口` 亦可。也可改用「远程 URL」模式（列表内容更新后订阅自动跟随） |
-| **生成数量** | 留空 = 全部；填 N = 只取列表前 N 条 |
-| **按端口自动匹配 TLS** | 默认勾选：TLS 端口（443/2053/2083/2087/2096/8443）自动补 `tls`，明文端口（80/8080/8880/2052/2082/2086/2095）自动去掉。不勾选则保持源节点原样 |
-| **生成随机 User-Agent 头** | 默认不勾选。勾选后 Clash 导出的 ws 节点会带随机浏览器 UA |
-| **输出格式** | 自动（跟随源）/ base64 / 明文 / Clash 配置 |
-| **Clash 模板** | 可选。粘贴自己的 config.yaml，顶层 `proxies:` 段会被替换；`proxy-groups` 里可用 `__PROXIES_NAMES__` 占位符插入节点名。留空用内置默认模板 |
+| **① 源订阅** | 每行一条，可混写订阅链接与裸节点。支持 Clash YAML、base64、明文分享链接；中文/符号/空行自动忽略；重复自动去重 |
+| **② 自定义优选与汇聚** | 留空 = 纯汇总模式。可混写优选域名、IPv4/IPv6、IP API、`sub://`、汇聚订阅、现成节点，行尾 `#备注` |
+| **③ 拉取源 UA** | 默认 **Clash（`clash.meta`）**。部分机场按 UA 返回不同格式，只有 Clash 系 UA 能拿到真实 mihomo YAML |
+| **④ 选择输出格式** | 默认 **Clash**；另有 自动 / Base64 / 明文 |
 
-点「生成订阅地址」→ 复制/扫码给客户端即可。
+点「保存并更新」→ 短链卡出现，可 **显示 / 复制 / 预览 / 二维码 / 打开**。
 
-**两条典型用法：**
+### 「自定义优选与汇聚」写法
 
-- **Clash 用户**：拉取 UA 选 `Clash` + 输出格式选 `Clash 配置` → 得到完整 config.yaml（内置模板含 dns/proxy-groups/rules，或用你自己的模板）
-- **v2rayN / v2rayNG 用户**：拉取 UA 选 `v2rayNG`（或保持自动）+ 输出格式 `自动` → 得到 base64 节点列表
+```text
+# 优选 IP / 域名
+104.16.0.1
+104.16.0.2:2053
+104.16.0.3:80
+[2606:4700::1]:8443
+cf.090227.xyz
+104.16.0.4:443 #香港
 
-### 配对规则
+# 优选 IP API
+https://raw.githubusercontent.com/user/repo/main/ips-v4.txt
+sub://你的订阅域名/path
+https://github.com/user/repo/blob/main/list.txt
 
-设源订阅解析出 n 个节点，实测列表 m 条：输出 **m 条**；第 i 条实测替换第 i 个节点的地址端口；i 超出节点数时用**第 1 个节点**的参数；节点多余的整条删除（proxy-groups 里的失效引用一并清理）。名称：实测条目带 `#名称` 原样使用，否则默认 `ip:端口`。
+# 汇聚订阅 / 现成节点
+https://example.com/api/v1/client/subscribe?token=xxx
+vless://uuid@1.2.3.4:443?security=tls&sni=a.com&type=ws&path=/ws#节点名
+```
 
-**信息节点原样保留**：名字含「剩余 / 过期 / 到期 / 还剩 / 流量 / 重置 / 官网 / expire / traffic」等关键词的节点（通常是订阅展示有效期/流量的占位节点）**不参与配对、不被替换、不被删除**，原样输出。
+规则：
+
+- 每行一条，`#` 后是备注（写进节点名）；
+- 省略端口默认 `443`（TLS 池）；
+- IPv6 带端口时用方括号，如 `[2606:4700::1]:8443`；
+- 裸节点支持 `vless / vmess / trojan / ss / hysteria2 / tuic / anytls`；
+- 也兼容 CloudflareST 的 CSV（`IP,已发送,已接收,...`）；
+- 页面内点 **📍 填写说明** 可查看完整示例。
 
 ---
 
 ## URL 参数（可直接构造订阅地址）
 
-```
-https://你的域名/<自定义路径，默认 /re>?url=<源订阅>&add=<实测列表>&addapi=<列表URL>&num=<数量>&format=<格式>&pullua=<拉取UA>&ua=1&tls=0&template=<Clash模板>
+```text
+https://你的域名/re?url=<源订阅>&link=<内联节点>&add=<优选/汇聚>&addapi=<列表URL>&num=<数量>&format=<格式>&pullua=<拉取UA>&ua=1&template=<Clash模板>
 ```
 
 | 参数 | 说明 |
 |---|---|
-| `url` | 源订阅地址（与 `link` 至少一个） |
-| `link` | 内联节点链接，每行一个（URL 编码） |
-| `add` | 内联实测列表，逗号或换行分隔 |
-| `addapi` | 实测列表 URL（内容格式同 `add`；**更新列表内容后订阅自动跟随**） |
-| `num` | 生成数量，只截短 |
-| `format` | `auto`（默认，跟随源）/ `base64` / `plain` / `clash` |
-| `template` | 自定义 Clash 模板（仅 `format=clash` 且源为节点链接时生效） |
-| `pullua` | 拉取源订阅的 UA：`auto`（默认）/ `clash` / `mihomo` / `v2rayng` / `v2rayn` / `surge` / `shadowrocket` / 任意字符串 |
-| `ua` | `1` = 输出的 Clash 节点生成随机 User-Agent 头（默认 0） |
-| `tls` | `0` = 关闭按端口自动匹配 TLS（默认开启） |
+| `url` | 源订阅地址（可多行 / 多个，换行分隔并 URL 编码） |
+| `link` | 内联节点链接（每行一个，URL 编码） |
+| `add` | 多合一「自定义优选与汇聚」内容（URL 编码） |
+| `addapi` | 优选列表 URL，逗号或换行分隔（兼容旧链接） |
+| `num` | 只取优选列表前 N 条 |
+| `format` | `clash`（默认）/ `auto` / `base64` / `plain` |
+| `pullua` | 拉取源 UA：`clash`（默认）/ `auto` / `v2rayng` / `v2rayn` / `surge` / `shadowrocket` |
+| `ua` | `1` = 导出的 Clash ws 节点带随机浏览器 UA（默认 0） |
+| `template` | 自定义 Clash 模板（`format=clash` 时生效） |
 
-**已生成的订阅链接，列表内容变化会自动跟随吗？** 会——只要实测列表用的是远程 URL（`addapi`），每次客户端刷新都会重新拉列表。用内联文本（`add`）的则固定在链接里，需要重新生成。
+**已生成的订阅会自动跟随吗？** 只要优选 / 汇聚用的是远程 URL（`add` 里的链接或 `addapi`），每次客户端刷新都会重新拉取；内联文本则固定在链接里。
 
 ---
 
 ## 常见问题
 
 **连不上节点？**
-按优先级排查：① **源节点在 Cloudflare 后面吗**（见顶部「重要前提」）——非 CF 节点替换后必然连不上；② 实测列表的端口与你实测时的协议族一致吗（TLS 端口配 TLS 测速、明文端口配明文测速）——工具会自动对齐到端口族，但如果实测本身不通，输出也不通；③ 源订阅是不是最近换过节点（自适应源每次拉取内容会轮换）；④ 客户端日志里的具体错误。
+① 确认源节点在 Cloudflare 后面（优选 IP 只加速「你 → CF 边缘」这一段，裸 VPS 源站替换后必然连不上）；② 确认优选端口的协议族与测速时一致（TLS 端口配 TLS 测速、明文端口配明文测速）；③ 看预览里的来源失败与警告信息；④ 看客户端日志。
+
+**为什么我的节点变少了？**
+CF 优选模式下，同一个独立 CF 落地只保留 1 条基准原节点（其余同落地副本被合并），再追加优选线路。纯汇总模式不会减少节点。
+
+**为什么有节点没被替换？**
+它们要么不是 CF 节点（Reality / Hysteria2 / SS / 信息节点等），要么对应类型的优选池为空。缺失类型会明确提示，不会跨类型替换。
 
 **`*.workers.dev` 打不开？**
-部分网络的 DNS 会污染 workers.dev。给自己绑一个自定义域名（Worker → 设置 → 域名和路由），用自定义域名访问。
-
-**实测列表的 URL 带签名（如 alist 直链 `?sign=...`）会过期吗？**
-会。过期后拉取失败，此时工具会**原样返回源订阅**（不会给客户端坏配置），但你的优选就失效了。订阅链接里的列表 URL 请使用不带签名的固定地址，或把列表以文本方式存进配置档。
+部分网络 DNS 污染 workers.dev。给 Worker 绑自定义域名（Worker → 设置 → 域名和路由）即可。
 
 **源订阅里含我的 uuid，会泄露吗？**
-生成的订阅 URL（及 KV 短链的 `k` 密钥）本身就是访问凭据，请勿公开分享。KV 短链只认密钥。
+生成的订阅链接（及 KV 短链的 `k`）本身就是访问凭据，请勿公开分享。
 
-**支持 UDP / 订阅转换（YAML↔链接互转）吗？**
-不支持。优选 Worker 节点无 UDP relay；格式互转请配合 subconverter 类工具（本项目的拉取 UA 设计参考了 subconverter 的自动识别机制）。
+**支持 SSR / WireGuard / Snell 吗？**
+源里出现时可以解析保留，但导出为 Clash 时仅覆盖 `vless / vmess / trojan / ss / hysteria2 / tuic / anytls`；暂不支持导出的节点会被跳过并在文件头注释。
 
 ---
 
 ## 开发
 
-单文件 Worker（`sublink-worker.js`），无构建、无依赖。
+单文件 Worker（`sublink-worker.js`），无构建、无依赖，前端页面也内联在同一文件里。
 
 ```sh
 node --check sublink-worker.js   # 语法检查
 npx wrangler@4 dev               # 本地预览（改代码即时生效，不部署）
 ```
 
-本地测试（miniflare + undici MockAgent 覆盖配对/TLS 对齐/格式/UA/KV 全场景）脚本未随仓库分发，需要的话提 issue。
+文件末尾有 `export` 测试钩子（`extractSources` / `parseAllInOneRaw` / `detectCFNodes` / `runSpeedSubPipeline` 等），可用 Node 直接导入做单元测试，不影响 Worker 运行。
 
 ---
 
 ## 致谢
 
 - [cmliu/WorkerVless2sub](https://github.com/cmliu/WorkerVless2sub) —— 本仓库的起点
+- [yegetables/edgetunnel](https://github.com/yegetables/edgetunnel) —— 优选订阅模式与多合一输入框的交互参考
 - [subconverter](https://github.com/tindy2013/subconverter) 及其社区分支 —— 按客户端 UA 自适应返回订阅格式的机制参考
-- [ACL4SSR](https://github.com/cmliu/ACL4SSR) —— Clash 模板规则来源
 
 ## License
 
