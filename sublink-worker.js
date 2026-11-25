@@ -1477,6 +1477,7 @@ function uriNodeToClashObj(node, addRandomUA = false) {
 		} else {
 			proxy.tls = false;
 		}
+		if (p.ech) proxy['ech-opts'] = { enable: true, config: p.ech };
 		if (type === 'vless' && p.flow) proxy.flow = p.flow;
 		return proxy;
 	}
@@ -1601,6 +1602,7 @@ function clashNodeToShareUri(node) {
 		if (o['client-fingerprint']) q.push(['fp', o['client-fingerprint']]);
 		if (Array.isArray(o.alpn) && o.alpn.length) q.push(['alpn', o.alpn.join(',')]);
 		if (o['skip-cert-verify'] === true) q.push(['allowInsecure', '1']);
+		if (o['ech-opts'] && typeof o['ech-opts'] === 'object' && o['ech-opts'].config) q.push(['ech', o['ech-opts'].config]);
 
 		q.push(['type', net]);
 		if (net === 'ws') {
